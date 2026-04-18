@@ -1,5 +1,8 @@
+import pytest
+from pydantic_ai.models.test import TestModel
+
 from app.backends.base import Task
-from app.sorter import Assignment, CategorizedItems, render_prompt
+from app.sorter import Assignment, CategorizedItems, categorize, render_prompt
 
 
 def test_render_prompt_with_hits_and_misses():
@@ -29,3 +32,25 @@ def test_schemas():
     a = Assignment(item_id="1", category_name="A")
     c = CategorizedItems(assignments=[a])
     assert c.assignments[0].item_id == "1"
+
+
+@pytest.mark.asyncio
+async def test_categorize_with_test_model():
+    fixed = {
+        "assignments": [
+            {"item_id": "1", "category_name": "🍎 Fruit"},
+            {"item_id": "2", "category_name": "🥬 Vegetables"},
+        ]
+    }
+    model = TestModel(custom_output_args=fixed)
+
+    result = await categorize(
+        model=model,
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+        description=None,
+        hits={},
+        misses=[Task(id="1", content="Apples"), Task(id="2", content="Lettuce")],
+    )
+
+    ids = {a.item_id: a.category_name for a in result.assignments}
+    assert ids == {"1": "🍎 Fruit", "2": "🥬 Vegetables"}
