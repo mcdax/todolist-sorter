@@ -2,6 +2,8 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import os
 import uuid
 from typing import ClassVar
 
@@ -9,6 +11,8 @@ import httpx
 
 from app.backends.base import ProviderProject, Task
 from app.models import SortingProject
+
+log = logging.getLogger(__name__)
 
 
 _API_BASE = "https://api.todoist.com/api/v1"
@@ -30,11 +34,25 @@ class TodoistBackend:
     def verify_webhook(self, headers: dict[str, str], body: bytes) -> bool:
         sig = _get_header(headers, "X-Todoist-Hmac-SHA256")
         if not sig:
+            if os.environ.get("WEBHOOK_DEBUG"):
+                log.warning("webhook: missing X-Todoist-Hmac-SHA256 header")
             return False
         expected = base64.b64encode(
             hmac.new(self._client_secret.encode(), body, hashlib.sha256).digest()
         ).decode()
-        return hmac.compare_digest(sig, expected)
+        ok = hmac.compare_digest(sig, expected)
+        if not ok and os.environ.get("WEBHOOK_DEBUG"):
+            body_preview = body[:200].decode("utf-8", errors="replace")
+            log.warning(
+                "webhook HMAC mismatch:\n"
+                "  received_sig = %s\n"
+                "  expected_sig = %s\n"
+                "  body_length  = %d\n"
+                "  body_preview = %r\n"
+                "  secret_len   = %d",
+                sig, expected, len(body), body_preview, len(self._client_secret),
+            )
+        return ok
 
     # ------------------------------------------------------------------
     # Payload parsing

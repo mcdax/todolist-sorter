@@ -1,4 +1,5 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from uuid import UUID
 
@@ -18,8 +19,31 @@ from app.sorter import sort_project
 from app.suppression import SuppressionTracker
 
 
+# pydantic-ai picks credentials up from provider-specific env vars.
+# Map the prefix of `LLM_MODEL` (e.g. "anthropic:claude-...") to the right one
+# so users only have to set `LLM_API_KEY` in .env.
+_PROVIDER_ENV_VAR = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "google-gla": "GOOGLE_API_KEY",
+    "google-vertex": "GOOGLE_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "cohere": "COHERE_API_KEY",
+}
+
+
+def _export_llm_api_key(model: str, api_key: str) -> None:
+    provider = model.split(":", 1)[0] if ":" in model else ""
+    env_var = _PROVIDER_ENV_VAR.get(provider)
+    if env_var and not os.environ.get(env_var):
+        os.environ[env_var] = api_key
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
+    _export_llm_api_key(settings.llm_model, settings.llm_api_key)
     engine = make_engine(settings.database_url)
     create_db_and_tables(engine)
 
