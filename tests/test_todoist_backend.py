@@ -93,11 +93,14 @@ from app.models import SortingProject
 
 @pytest.mark.asyncio
 async def test_get_tasks_happy_path(respx_mock):
-    respx_mock.get("https://api.todoist.com/rest/v2/tasks").mock(
-        return_value=httpx.Response(200, json=[
-            {"id": "111", "content": "Apples", "project_id": "999", "order": 1},
-            {"id": "222", "content": "Milk", "project_id": "999", "order": 2},
-        ])
+    respx_mock.get("https://api.todoist.com/api/v1/tasks").mock(
+        return_value=httpx.Response(200, json={
+            "results": [
+                {"id": "111", "content": "Apples", "project_id": "999", "order": 1},
+                {"id": "222", "content": "Milk", "project_id": "999", "order": 2},
+            ],
+            "next_cursor": None,
+        })
     )
     b = TodoistBackend(api_token="tok", client_secret="s")
     project = SortingProject(
@@ -117,7 +120,7 @@ from urllib.parse import parse_qs
 
 @pytest.mark.asyncio
 async def test_reorder_calls_sync_api(respx_mock):
-    route = respx_mock.post("https://api.todoist.com/sync/v9/sync").mock(
+    route = respx_mock.post("https://api.todoist.com/api/v1/sync").mock(
         return_value=httpx.Response(200, json={"sync_status": {}})
     )
     b = TodoistBackend(api_token="tok", client_secret="s")
@@ -143,11 +146,14 @@ async def test_reorder_calls_sync_api(respx_mock):
 
 @pytest.mark.asyncio
 async def test_list_projects(respx_mock):
-    respx_mock.get("https://api.todoist.com/rest/v2/projects").mock(
-        return_value=httpx.Response(200, json=[
-            {"id": "111", "name": "Lidl Einkauf"},
-            {"id": "222", "name": "Private"},
-        ])
+    respx_mock.get("https://api.todoist.com/api/v1/projects").mock(
+        return_value=httpx.Response(200, json={
+            "results": [
+                {"id": "111", "name": "Lidl Einkauf"},
+                {"id": "222", "name": "Private"},
+            ],
+            "next_cursor": None,
+        })
     )
     b = TodoistBackend(api_token="tok", client_secret="s")
     projects = await b.list_projects()
@@ -158,7 +164,7 @@ async def test_list_projects(respx_mock):
 
 @pytest.mark.asyncio
 async def test_reorder_skips_empty(respx_mock):
-    route = respx_mock.post("https://api.todoist.com/sync/v9/sync").mock(
+    route = respx_mock.post("https://api.todoist.com/api/v1/sync").mock(
         return_value=httpx.Response(200, json={})
     )
     b = TodoistBackend(api_token="tok", client_secret="s")
@@ -168,3 +174,29 @@ async def test_reorder_skips_empty(respx_mock):
     )
     await b.reorder(project, [])
     assert not route.called
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_paginates(respx_mock):
+    route = respx_mock.get("https://api.todoist.com/api/v1/tasks").mock(
+        side_effect=[
+            httpx.Response(200, json={
+                "results": [{"id": "1", "content": "A"}],
+                "next_cursor": "c2",
+            }),
+            httpx.Response(200, json={
+                "results": [{"id": "2", "content": "B"}],
+                "next_cursor": None,
+            }),
+        ]
+    )
+    b = TodoistBackend(api_token="tok", client_secret="s")
+    project = SortingProject(
+        name="L", provider="todoist",
+        external_project_id="999", categories=[],
+    )
+    tasks = await b.get_tasks(project)
+    assert [(t.id, t.content) for t in tasks] == [("1", "A"), ("2", "B")]
+    # Second call must have sent the cursor
+    q = dict(route.calls[1].request.url.params)
+    assert q.get("cursor") == "c2"

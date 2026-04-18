@@ -89,16 +89,19 @@ async def test_end_to_end_webhook_sort_flow():
     ))
 
     with respx.mock(assert_all_called=False) as mock:
-        mock.get("https://api.todoist.com/rest/v2/tasks").mock(
-            return_value=httpx.Response(200, json=[
-                {"id": "T1", "content": "Apples",
-                 "project_id": "999", "order": 1},
-                {"id": "T2", "content": "Lettuce",
-                 "project_id": "999", "order": 2},
-            ])
+        mock.get("https://api.todoist.com/api/v1/tasks").mock(
+            return_value=httpx.Response(200, json={
+                "results": [
+                    {"id": "T1", "content": "Apples",
+                     "project_id": "999", "order": 1},
+                    {"id": "T2", "content": "Lettuce",
+                     "project_id": "999", "order": 2},
+                ],
+                "next_cursor": None,
+            })
         )
         reorder_route = mock.post(
-            "https://api.todoist.com/sync/v9/sync"
+            "https://api.todoist.com/api/v1/sync"
         ).mock(return_value=httpx.Response(200, json={"sync_status": {}}))
 
         body = json.dumps({

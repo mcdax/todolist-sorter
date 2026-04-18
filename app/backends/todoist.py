@@ -11,8 +11,8 @@ from app.backends.base import ProviderProject, Task
 from app.models import SortingProject
 
 
-_REST_BASE = "https://api.todoist.com/rest/v2"
-_SYNC_URL = "https://api.todoist.com/sync/v9/sync"
+_API_BASE = "https://api.todoist.com/api/v1"
+_SYNC_URL = "https://api.todoist.com/api/v1/sync"
 _TRIGGER_EVENTS = {"item:added", "item:updated"}
 
 
@@ -76,29 +76,47 @@ class TodoistBackend:
     # ------------------------------------------------------------------
 
     async def get_tasks(self, project: SortingProject) -> list[Task]:
+        tasks: list[Task] = []
+        cursor: str | None = None
         async with self._client() as c:
-            r = await c.get(
-                f"{_REST_BASE}/tasks",
-                params={"project_id": project.external_project_id},
-            )
-            r.raise_for_status()
-            return [
-                Task(id=str(item["id"]), content=item["content"])
-                for item in r.json()
-            ]
+            while True:
+                params = {
+                    "project_id": project.external_project_id,
+                    "limit": 200,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                r = await c.get(f"{_API_BASE}/tasks", params=params)
+                r.raise_for_status()
+                data = r.json()
+                for item in data.get("results", []):
+                    tasks.append(Task(id=str(item["id"]), content=item["content"]))
+                cursor = data.get("next_cursor")
+                if not cursor:
+                    break
+        return tasks
 
     # ------------------------------------------------------------------
     # REST: list projects
     # ------------------------------------------------------------------
 
     async def list_projects(self) -> list[ProviderProject]:
+        projects: list[ProviderProject] = []
+        cursor: str | None = None
         async with self._client() as c:
-            r = await c.get(f"{_REST_BASE}/projects")
-            r.raise_for_status()
-            return [
-                ProviderProject(id=str(p["id"]), name=p["name"])
-                for p in r.json()
-            ]
+            while True:
+                params: dict = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                r = await c.get(f"{_API_BASE}/projects", params=params)
+                r.raise_for_status()
+                data = r.json()
+                for p in data.get("results", []):
+                    projects.append(ProviderProject(id=str(p["id"]), name=p["name"]))
+                cursor = data.get("next_cursor")
+                if not cursor:
+                    break
+        return projects
 
     # ------------------------------------------------------------------
     # Sync API: reorder tasks
