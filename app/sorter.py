@@ -1,0 +1,207 @@
+import logging
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.models import Model
+from sqlmodel import Session, select
+
+from app.backends.base import Task
+from app.models import CategoryCache, SortingProject
+from app.normalize import content_key as _content_key
+
+log = logging.getLogger(__name__)
+
+
+class Assignment(BaseModel):
+    item_id: str
+    category_name: str
+
+
+class CategorizedItems(BaseModel):
+    assignments: list[Assignment]
+
+
+SYSTEM_PROMPT = (
+    "You categorize shopping list items into the given categories. "
+    "Respond strictly in the required JSON schema. Pick exactly one "
+    "category from the list for each item to be categorized. Do not "
+    "invent categories and do not change the reference assignments."
+)
+
+
+def render_prompt(
+    *,
+    categories: list[str],
+    description: str | None,
+    hits: dict[str, str],
+    misses: list[Task],
+) -> str:
+    lines: list[str] = []
+    lines.append("Categories (in this order):")
+    for i, name in enumerate(categories, 1):
+        lines.append(f"  {i}. {name}")
+    lines.append("")
+    if description:
+        lines.append(description)
+        lines.append("")
+    if hits:
+        lines.append("Already assigned (for reference only, do not change):")
+        for content, cat in hits.items():
+            lines.append(f"  - {content} → {cat}")
+        lines.append("")
+    lines.append("Please categorize:")
+    for task in misses:
+        lines.append(f'  - id={task.id}, content="{task.content}"')
+    return "\n".join(lines)
+
+
+async def categorize(
+    *,
+    model: Model | str,
+    categories: list[str],
+    description: str | None,
+    hits: dict[str, str],
+    misses: list[Task],
+) -> CategorizedItems:
+    agent = Agent(
+        model,
+        output_type=CategorizedItems,
+        system_prompt=SYSTEM_PROMPT,
+    )
+    prompt = render_prompt(
+        categories=categories,
+        description=description,
+        hits=hits,
+        misses=misses,
+    )
+    result = await agent.run(prompt)
+    return result.output
+
+
+def validate_assignments(
+    result: CategorizedItems,
+    *,
+    categories: list[str],
+    requested_ids: set[str],
+) -> list[Assignment]:
+    cat_set = set(categories)
+    seen: set[str] = set()
+    valid: list[Assignment] = []
+    for a in result.assignments:
+        if a.item_id not in requested_ids:
+            continue
+        if a.item_id in seen:
+            continue
+        if a.category_name not in cat_set:
+            continue
+        seen.add(a.item_id)
+        valid.append(a)
+    return valid
+
+
+def compute_reorder(
+    tasks: list[Task],
+    categories: list[str],
+    assignments: dict[str, str],
+) -> list[str]:
+    cat_index = {name: i for i, name in enumerate(categories)}
+    orphan_index = len(categories)
+    positioned = []
+    for pos, t in enumerate(tasks):
+        cat_name = assignments.get(t.id)
+        idx = cat_index.get(cat_name, orphan_index) if cat_name else orphan_index
+        positioned.append((idx, pos, t.id))
+    positioned.sort(key=lambda x: (x[0], x[1]))
+    return [tid for _, _, tid in positioned]
+
+
+CategorizeFn = Callable[..., Awaitable[CategorizedItems]]
+ReorderCallback = Callable[[UUID, list[str]], None]
+
+
+async def sort_project(
+    *,
+    project_id: UUID,
+    session: Session,
+    backend: Any,
+    llm_model: Any,
+    categorize_fn: CategorizeFn = categorize,
+    on_reorder: ReorderCallback = lambda _pid, _ids: None,
+) -> None:
+    project = session.get(SortingProject, project_id)
+    if not project or not project.enabled:
+        return
+
+    tasks = await backend.get_tasks(project)
+    if len(tasks) < 2:
+        return
+
+    keys = {t.id: _content_key(t.content) for t in tasks}
+    cache_rows = session.exec(
+        select(CategoryCache).where(CategoryCache.project_id == project_id)
+    ).all()
+    cached = {c.content_key: c.category_name for c in cache_rows}
+
+    assignments: dict[str, str] = {}
+    hit_contents: dict[str, str] = {}
+    misses: list[Task] = []
+    for t in tasks:
+        k = keys[t.id]
+        if k in cached:
+            assignments[t.id] = cached[k]
+            hit_contents[t.content] = cached[k]
+        else:
+            misses.append(t)
+
+    if misses:
+        try:
+            result = await categorize_fn(
+                model=llm_model,
+                categories=project.categories,
+                description=project.description,
+                hits=hit_contents,
+                misses=misses,
+            )
+        except Exception:
+            log.exception("LLM categorization failed for project %s", project_id)
+            return
+        valid = validate_assignments(
+            result,
+            categories=project.categories,
+            requested_ids={m.id for m in misses},
+        )
+        for a in valid:
+            assignments[a.item_id] = a.category_name
+            miss_content = next(m.content for m in misses if m.id == a.item_id)
+            _upsert_cache(session, project_id,
+                          _content_key(miss_content), a.category_name)
+        session.commit()
+
+    current = await backend.get_tasks(project)
+    current_ids = {t.id for t in current}
+    ordered = [
+        tid for tid in compute_reorder(current, project.categories, assignments)
+        if tid in current_ids
+    ]
+    if len(ordered) < 2:
+        return
+    await backend.reorder(project, ordered)
+    on_reorder(project_id, ordered)
+
+
+def _upsert_cache(
+    session: Session, project_id: UUID, ckey: str, category_name: str
+) -> None:
+    existing = session.get(CategoryCache, (project_id, ckey))
+    if existing:
+        if existing.category_name != category_name:
+            existing.category_name = category_name
+            existing.updated_at = datetime.now(timezone.utc)
+        return
+    session.add(CategoryCache(
+        project_id=project_id, content_key=ckey, category_name=category_name,
+    ))
