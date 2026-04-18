@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from uuid import UUID
@@ -43,6 +44,10 @@ def _export_llm_api_key(model: str, api_key: str) -> None:
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
     _export_llm_api_key(settings.llm_model, settings.llm_api_key)
     engine = make_engine(settings.database_url)
     create_db_and_tables(engine)
