@@ -38,3 +38,8 @@ class CategoryCache(SQLModel, table=True):
     category_name: str
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+    def __init__(self, **kwargs: object) -> None:
+        if "project_id" in kwargs and isinstance(kwargs["project_id"], str):
+            kwargs["project_id"] = UUID(kwargs["project_id"])
+        super().__init__(**kwargs)

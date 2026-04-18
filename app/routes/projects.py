@@ -226,4 +226,32 @@ def build_router(
         on_sort_requested(pid)
         return p.categories
 
+    @router.get("/{pid}/cache")
+    def get_cache(pid: UUID, s: Session = Depends(_get_session)):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        from app.models import CategoryCache
+        rows = s.exec(
+            select(CategoryCache).where(CategoryCache.project_id == pid)
+        ).all()
+        return [{"content_key": r.content_key,
+                 "category_name": r.category_name} for r in rows]
+
+    @router.delete("/{pid}/cache", status_code=status.HTTP_204_NO_CONTENT)
+    def clear_cache(pid: UUID, s: Session = Depends(_get_session)):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        _clear_cache(s, pid)
+        s.commit()
+
+    @router.post("/{pid}/sort", status_code=status.HTTP_202_ACCEPTED)
+    def trigger_sort(pid: UUID, s: Session = Depends(_get_session)):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        on_sort_requested(pid)
+        return {"status": "queued"}
+
     return router
