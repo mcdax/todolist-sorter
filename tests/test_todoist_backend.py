@@ -83,3 +83,29 @@ def test_extract_trigger_content_none_for_other_events():
         "event_data": {"id": "1", "content": "Apples", "project_id": "9"},
     }
     assert b.extract_trigger_content(payload) is None
+
+
+import httpx
+import pytest
+
+from app.models import SortingProject
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_happy_path(respx_mock):
+    respx_mock.get("https://api.todoist.com/rest/v2/tasks").mock(
+        return_value=httpx.Response(200, json=[
+            {"id": "111", "content": "Apples", "project_id": "999", "order": 1},
+            {"id": "222", "content": "Milk", "project_id": "999", "order": 2},
+        ])
+    )
+    b = TodoistBackend(api_token="tok", client_secret="s")
+    project = SortingProject(
+        name="Lidl", provider="todoist",
+        external_project_id="999", categories=[],
+    )
+
+    tasks = await b.get_tasks(project)
+
+    assert [t.id for t in tasks] == ["111", "222"]
+    assert tasks[0].content == "Apples"
