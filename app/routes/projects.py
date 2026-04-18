@@ -103,4 +103,127 @@ def build_router(
             raise HTTPException(404)
         s.delete(p); s.commit()
 
+    from pydantic import BaseModel as _BM
+
+    class CategoryAdd(_BM):
+        name: str
+        at_index: int | None = None
+
+    class CategoryPatch(_BM):
+        name: str | None = None
+        move_to: int | None = None
+
+    class CategoriesReplace(_BM):
+        categories: list[str]
+
+    def _clear_cache(s: Session, pid: UUID) -> None:
+        from app.models import CategoryCache
+        for row in s.exec(
+            select(CategoryCache).where(CategoryCache.project_id == pid)
+        ).all():
+            s.delete(row)
+
+    def _clear_for_category(s: Session, pid: UUID, name: str) -> None:
+        from app.models import CategoryCache
+        for row in s.exec(
+            select(CategoryCache).where(
+                CategoryCache.project_id == pid,
+                CategoryCache.category_name == name,
+            )
+        ).all():
+            s.delete(row)
+
+    @router.get("/{pid}/categories", response_model=list[str])
+    def list_categories(pid: UUID, s: Session = Depends(_get_session)):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        return p.categories
+
+    @router.put("/{pid}/categories", response_model=list[str])
+    def replace_categories(
+        pid: UUID, body: CategoriesReplace,
+        s: Session = Depends(_get_session),
+    ):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        old = set(p.categories)
+        new = set(body.categories)
+        if new - old:
+            _clear_cache(s, pid)
+        else:
+            for removed in old - new:
+                _clear_for_category(s, pid, removed)
+        p.categories = list(body.categories)
+        p.updated_at = datetime.now(timezone.utc)
+        s.add(p); s.commit(); s.refresh(p)
+        on_sort_requested(pid)
+        return p.categories
+
+    @router.post("/{pid}/categories", response_model=list[str])
+    def add_category(
+        pid: UUID, body: CategoryAdd, s: Session = Depends(_get_session),
+    ):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        cats = list(p.categories)
+        idx = body.at_index if body.at_index is not None else len(cats)
+        if idx < 0 or idx > len(cats):
+            raise HTTPException(422, "at_index out of range")
+        cats.insert(idx, body.name)
+        p.categories = cats
+        p.updated_at = datetime.now(timezone.utc)
+        _clear_cache(s, pid)
+        s.add(p); s.commit(); s.refresh(p)
+        on_sort_requested(pid)
+        return p.categories
+
+    @router.delete("/{pid}/categories/{index}", response_model=list[str])
+    def remove_category(
+        pid: UUID, index: int, s: Session = Depends(_get_session),
+    ):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        cats = list(p.categories)
+        if index < 0 or index >= len(cats):
+            raise HTTPException(422, "index out of range")
+        removed = cats.pop(index)
+        p.categories = cats
+        p.updated_at = datetime.now(timezone.utc)
+        _clear_for_category(s, pid, removed)
+        s.add(p); s.commit(); s.refresh(p)
+        on_sort_requested(pid)
+        return p.categories
+
+    @router.patch("/{pid}/categories/{index}", response_model=list[str])
+    def patch_category(
+        pid: UUID, index: int, body: CategoryPatch,
+        s: Session = Depends(_get_session),
+    ):
+        p = s.get(SortingProject, pid)
+        if not p:
+            raise HTTPException(404)
+        cats = list(p.categories)
+        if index < 0 or index >= len(cats):
+            raise HTTPException(422, "index out of range")
+        renamed = body.name is not None and body.name != cats[index]
+        if renamed:
+            cats[index] = body.name
+        if body.move_to is not None:
+            target = body.move_to
+            if target < 0 or target >= len(cats):
+                raise HTTPException(422, "move_to out of range")
+            item = cats.pop(index)
+            cats.insert(target, item)
+        p.categories = cats
+        p.updated_at = datetime.now(timezone.utc)
+        if renamed:
+            _clear_cache(s, pid)
+        s.add(p); s.commit(); s.refresh(p)
+        on_sort_requested(pid)
+        return p.categories
+
     return router
