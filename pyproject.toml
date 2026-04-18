@@ -10,6 +10,7 @@ dependencies = [
     "pydantic-settings>=2.6",
     "pydantic-ai>=0.0.13",
     "httpx>=0.27",
+    "click>=8.0",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +30,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[project.scripts]
+todolist-sorter = "app.cli:main"
