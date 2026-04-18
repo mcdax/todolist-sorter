@@ -109,3 +109,47 @@ async def test_get_tasks_happy_path(respx_mock):
 
     assert [t.id for t in tasks] == ["111", "222"]
     assert tasks[0].content == "Apples"
+
+
+import json as _json
+from urllib.parse import parse_qs
+
+
+@pytest.mark.asyncio
+async def test_reorder_calls_sync_api(respx_mock):
+    route = respx_mock.post("https://api.todoist.com/sync/v9/sync").mock(
+        return_value=httpx.Response(200, json={"sync_status": {}})
+    )
+    b = TodoistBackend(api_token="tok", client_secret="s")
+    project = SortingProject(
+        name="Lidl", provider="todoist",
+        external_project_id="999", categories=[],
+    )
+
+    await b.reorder(project, ["222", "111", "333"])
+
+    assert route.called
+    form = parse_qs(route.calls.last.request.content.decode())
+    commands = _json.loads(form["commands"][0])
+    assert len(commands) == 1
+    cmd = commands[0]
+    assert cmd["type"] == "item_reorder"
+    assert cmd["args"]["items"] == [
+        {"id": "222", "child_order": 1},
+        {"id": "111", "child_order": 2},
+        {"id": "333", "child_order": 3},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reorder_skips_empty(respx_mock):
+    route = respx_mock.post("https://api.todoist.com/sync/v9/sync").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    b = TodoistBackend(api_token="tok", client_secret="s")
+    project = SortingProject(
+        name="Lidl", provider="todoist",
+        external_project_id="999", categories=[],
+    )
+    await b.reorder(project, [])
+    assert not route.called
