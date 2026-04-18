@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.models import SortingProject
@@ -70,7 +71,17 @@ def build_router(
             categories=body.categories, description=body.description,
             debounce_seconds=body.debounce_seconds,
         )
-        s.add(p); s.commit(); s.refresh(p)
+        s.add(p)
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"project with provider={body.provider!r} and "
+                f"external_project_id={body.external_project_id!r} already exists",
+            )
+        s.refresh(p)
         return _out(p)
 
     @router.get("", response_model=list[ProjectOut])

@@ -61,3 +61,14 @@ def test_delete_project(client):
 
 def test_auth_required(client):
     assert client.get("/projects").status_code == 401
+
+
+def test_create_duplicate_returns_409(client):
+    body = {
+        "name": "A", "provider": "todoist",
+        "external_project_id": "dup", "categories": [],
+    }
+    assert client.post("/projects", json=body, headers=AUTH).status_code == 201
+    r = client.post("/projects", json=body, headers=AUTH)
+    assert r.status_code == 409
+    assert "already exists" in r.json()["detail"]
