@@ -134,11 +134,19 @@ async def sort_project(
 ) -> None:
     project = session.get(SortingProject, project_id)
     if not project or not project.enabled:
+        log.info("sort aborted: project %s not found or disabled", project_id)
         return
 
     tasks = await backend.get_tasks(project)
     if len(tasks) < 2:
+        log.info(
+            "sort aborted: project %r has %d task(s), need at least 2",
+            project.name,
+            len(tasks),
+        )
         return
+
+    log.info("sort_project start: project=%r total_tasks=%d", project.name, len(tasks))
 
     keys = {t.id: _content_key(t.content) for t in tasks}
     cache_rows = session.exec(
@@ -154,10 +162,16 @@ async def sort_project(
         if k in cached:
             assignments[t.id] = cached[k]
             hit_contents[t.content] = cached[k]
+            log.info("cache hit: %s → %s", t.content, cached[k])
         else:
             misses.append(t)
 
     if misses:
+        log.info(
+            "%d item(s) need LLM: %s",
+            len(misses),
+            [m.content for m in misses],
+        )
         try:
             result = await categorize_fn(
                 model=llm_model,
@@ -174,11 +188,16 @@ async def sort_project(
             categories=project.categories,
             requested_ids={m.id for m in misses},
         )
+        assigned_ids = {a.item_id for a in valid}
         for a in valid:
             assignments[a.item_id] = a.category_name
             miss_content = next(m.content for m in misses if m.id == a.item_id)
+            log.info("LLM categorized: %s → %s", miss_content, a.category_name)
             _upsert_cache(session, project_id,
                           _content_key(miss_content), a.category_name)
+        for m in misses:
+            if m.id not in assigned_ids:
+                log.warning("orphan: %s", m.content)
         session.commit()
 
     current = await backend.get_tasks(project)
@@ -189,6 +208,9 @@ async def sort_project(
     ]
     if len(ordered) < 2:
         return
+    id_to_content = {t.id: t.content for t in current}
+    ordered_contents = [id_to_content[tid] for tid in ordered]
+    log.info("reordered %d items: %s", len(ordered), ordered_contents)
     await backend.reorder(project, ordered)
     on_reorder(project_id, ordered)
 

@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -208,3 +209,63 @@ async def test_sort_project_partial_miss_calls_llm_and_writes_cache(session: Ses
     assert cinnamon is not None
     assert cinnamon.category_name == "🍎 Fruit"
     backend.reorder.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sort_project_partial_miss_log_records(
+    session: Session, caplog: pytest.LogCaptureFixture
+):
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+    ))
+    session.add(CategoryCache(project_id=pid, content_key="apples",
+                              category_name="🍎 Fruit"))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Apples"),
+        Task(id="T2", content="Cinnamon"),
+    ])
+    backend.reorder = AsyncMock()
+
+    llm_category = "🍎 Fruit"
+
+    async def _llm(**kw):
+        return CategorizedItems(assignments=[
+            Assignment(item_id="T2", category_name=llm_category),
+        ])
+
+    caplog.set_level(logging.INFO, logger="app.sorter")
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_llm, on_reorder=lambda p, ids: None,
+    )
+
+    messages = [r.message for r in caplog.records]
+
+    # cache hit line for Apples
+    cache_hit_lines = [m for m in messages if "cache hit" in m]
+    assert any("Apples" in m and "🍎 Fruit" in m for m in cache_hit_lines), (
+        f"Expected a cache hit line with 'Apples' and '🍎 Fruit', got: {cache_hit_lines}"
+    )
+
+    # need LLM line for Cinnamon
+    need_llm_lines = [m for m in messages if "need LLM" in m]
+    assert any("Cinnamon" in m for m in need_llm_lines), (
+        f"Expected a need-LLM line with 'Cinnamon', got: {need_llm_lines}"
+    )
+
+    # LLM categorized line for Cinnamon
+    llm_cat_lines = [m for m in messages if "LLM categorized" in m]
+    assert any("Cinnamon" in m and llm_category in m for m in llm_cat_lines), (
+        f"Expected an LLM categorized line with 'Cinnamon' and '{llm_category}', got: {llm_cat_lines}"
+    )
+
+    # reordered line
+    reorder_lines = [m for m in messages if "reordered" in m]
+    assert reorder_lines, f"Expected a 'reordered' log line, got messages: {messages}"
