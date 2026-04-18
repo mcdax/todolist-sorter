@@ -12,6 +12,7 @@ from app.db import create_db_and_tables, get_session, make_engine
 from app.debouncer import ProjectDebouncer
 from app.models import SortingProject
 from app.routes.projects import build_router as build_projects_router
+from app.routes.providers import build_providers_router
 from app.routes.webhook import build_webhook_router
 from app.sorter import sort_project
 from app.suppression import SuppressionTracker
@@ -83,5 +84,9 @@ def create_app() -> FastAPI:
         suppression=suppression,
         session_dep=lambda: get_session(engine),
         default_delay=settings.default_debounce_seconds,
+    ))
+    app.include_router(build_providers_router(
+        api_key=settings.app_api_key,
+        registry=registry,
     ))
     return app

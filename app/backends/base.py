@@ -10,6 +10,11 @@ class Task(BaseModel):
     content: str
 
 
+class ProviderProject(BaseModel):
+    id: str
+    name: str
+
+
 @runtime_checkable
 class TaskBackend(Protocol):
     name: ClassVar[str]
@@ -23,3 +28,4 @@ class TaskBackend(Protocol):
     def extract_trigger_content(self, payload: dict) -> str | None: ...
     def extract_event_name(self, payload: dict) -> str | None: ...
     def extract_item_id(self, payload: dict) -> str | None: ...
+    async def list_projects(self) -> list[ProviderProject]: ...

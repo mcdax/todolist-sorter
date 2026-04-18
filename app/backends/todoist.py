@@ -7,7 +7,7 @@ from typing import ClassVar
 
 import httpx
 
-from app.backends.base import Task
+from app.backends.base import ProviderProject, Task
 from app.models import SortingProject
 
 
@@ -85,6 +85,19 @@ class TodoistBackend:
             return [
                 Task(id=str(item["id"]), content=item["content"])
                 for item in r.json()
+            ]
+
+    # ------------------------------------------------------------------
+    # REST: list projects
+    # ------------------------------------------------------------------
+
+    async def list_projects(self) -> list[ProviderProject]:
+        async with self._client() as c:
+            r = await c.get(f"{_REST_BASE}/projects")
+            r.raise_for_status()
+            return [
+                ProviderProject(id=str(p["id"]), name=p["name"])
+                for p in r.json()
             ]
 
     # ------------------------------------------------------------------

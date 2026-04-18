@@ -356,6 +356,100 @@ def test_http_500_error():
 
 
 # ---------------------------------------------------------------------------
+# remote list
+# ---------------------------------------------------------------------------
+
+
+def test_remote_list():
+    runner = CliRunner()
+    with respx.mock(base_url="http://localhost:8000") as mock:
+        mock.get("/providers/todoist/projects").mock(
+            return_value=httpx.Response(200, json=[
+                {"id": "111", "name": "Lidl"},
+                {"id": "222", "name": "Home"},
+            ])
+        )
+        result = runner.invoke(cli, ["remote", "list"],
+                               env={"TODOLIST_SORTER_API_KEY": "k"})
+    assert result.exit_code == 0
+    assert "Lidl" in result.output
+    assert "111" in result.output
+
+
+# ---------------------------------------------------------------------------
+# projects create — interactive picker
+# ---------------------------------------------------------------------------
+
+
+def test_projects_create_interactive():
+    runner = CliRunner()
+    with respx.mock(base_url="http://localhost:8000") as mock:
+        mock.get("/providers/todoist/projects").mock(
+            return_value=httpx.Response(200, json=[
+                {"id": "111", "name": "Lidl"},
+                {"id": "222", "name": "Home"},
+            ])
+        )
+        create_route = mock.post("/projects").mock(
+            return_value=httpx.Response(201, json={
+                "id": "abc", "name": "Lidl", "provider": "todoist",
+                "external_project_id": "111", "enabled": True,
+                "categories": [], "description": None,
+                "debounce_seconds": 5,
+            })
+        )
+        # simulate user typing "0\n"
+        result = runner.invoke(cli, ["projects", "create"],
+                               input="0\n",
+                               env={"TODOLIST_SORTER_API_KEY": "k"})
+    assert result.exit_code == 0
+    import json
+    payload = json.loads(create_route.calls.last.request.content)
+    assert payload["external_project_id"] == "111"
+    assert payload["name"] == "Lidl"  # defaulted from remote
+
+
+def test_projects_create_interactive_with_name_override():
+    runner = CliRunner()
+    with respx.mock(base_url="http://localhost:8000") as mock:
+        mock.get("/providers/todoist/projects").mock(
+            return_value=httpx.Response(200, json=[
+                {"id": "111", "name": "Lidl"},
+            ])
+        )
+        create_route = mock.post("/projects").mock(
+            return_value=httpx.Response(201, json={
+                "id": "abc", "name": "Custom", "provider": "todoist",
+                "external_project_id": "111", "enabled": True,
+                "categories": [], "description": None,
+                "debounce_seconds": 5,
+            })
+        )
+        result = runner.invoke(cli, ["projects", "create", "--name", "Custom"],
+                               input="0\n",
+                               env={"TODOLIST_SORTER_API_KEY": "k"})
+    assert result.exit_code == 0
+    import json
+    payload = json.loads(create_route.calls.last.request.content)
+    assert payload["name"] == "Custom"
+    assert payload["external_project_id"] == "111"
+
+
+def test_projects_create_out_of_range_fails():
+    runner = CliRunner()
+    with respx.mock(base_url="http://localhost:8000") as mock:
+        mock.get("/providers/todoist/projects").mock(
+            return_value=httpx.Response(200, json=[
+                {"id": "111", "name": "Lidl"},
+            ])
+        )
+        result = runner.invoke(cli, ["projects", "create"],
+                               input="5\n",
+                               env={"TODOLIST_SORTER_API_KEY": "k"})
+    assert result.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 

@@ -142,6 +142,21 @@ async def test_reorder_calls_sync_api(respx_mock):
 
 
 @pytest.mark.asyncio
+async def test_list_projects(respx_mock):
+    respx_mock.get("https://api.todoist.com/rest/v2/projects").mock(
+        return_value=httpx.Response(200, json=[
+            {"id": "111", "name": "Lidl Einkauf"},
+            {"id": "222", "name": "Private"},
+        ])
+    )
+    b = TodoistBackend(api_token="tok", client_secret="s")
+    projects = await b.list_projects()
+    assert [(p.id, p.name) for p in projects] == [
+        ("111", "Lidl Einkauf"), ("222", "Private"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reorder_skips_empty(respx_mock):
     route = respx_mock.post("https://api.todoist.com/sync/v9/sync").mock(
         return_value=httpx.Response(200, json={})

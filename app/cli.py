@@ -79,8 +79,8 @@ def list_projects(ctx):
 
 
 @projects.command("create")
-@click.option("--name", required=True, help="Project name.")
-@click.option("--external-id", required=True, help="External project ID.")
+@click.option("--name", default=None, help="Project name.")
+@click.option("--external-id", default=None, help="External project ID.")
 @click.option("--provider", default="todoist", show_default=True, help="Backend provider.")
 @click.option("--description", default=None, help="Optional description.")
 @click.option("--debounce-seconds", type=int, default=5, show_default=True,
@@ -91,6 +91,30 @@ def list_projects(ctx):
 def create_project(ctx, name, external_id, provider, description, debounce_seconds,
                    categories_file):
     """Create a new project."""
+    if external_id is None:
+        # Interactive picker: fetch remote projects and let the user choose.
+        r = ctx.obj["client"].get(f"/providers/{provider}/projects")
+        _handle(r)
+        remote = r.json()
+        if not remote:
+            click.echo(f"No remote projects for provider '{provider}'", err=True)
+            raise SystemExit(1)
+        click.echo(f"Remote {provider} projects:")
+        for i, p in enumerate(remote):
+            click.echo(f"  [{i}] {p['name']}  (id={p['id']})")
+        idx = click.prompt("Select number", type=int)
+        if idx < 0 or idx >= len(remote):
+            click.echo("out of range", err=True)
+            raise SystemExit(1)
+        picked = remote[idx]
+        external_id = picked["id"]
+        if name is None:
+            name = picked["name"]
+
+    if name is None:
+        click.echo("--name is required when --external-id is given", err=True)
+        raise SystemExit(1)
+
     categories: list[str] = []
     if categories_file:
         categories = _read_lines(categories_file)
@@ -280,6 +304,28 @@ def clear_cache(ctx, project_id, yes):
         click.confirm(f"Clear cache for project {project_id}?", abort=True)
     _handle(ctx.obj["client"].delete(f"/projects/{project_id}/cache"))
     click.echo(f"Cache cleared for {project_id}")
+
+
+# ---------------------------------------------------------------------------
+# remote group
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def remote():
+    """Query remote provider state (e.g. list Todoist projects)."""
+
+
+@remote.command("list")
+@click.option("--provider", default="todoist", show_default=True,
+              help="Backend provider.")
+@click.pass_context
+def list_remote_projects(ctx, provider):
+    """List projects available in the remote provider."""
+    r = ctx.obj["client"].get(f"/providers/{provider}/projects")
+    _handle(r)
+    for p in r.json():
+        click.echo(f"{p['id']:14}  {p['name']}")
 
 
 # ---------------------------------------------------------------------------
