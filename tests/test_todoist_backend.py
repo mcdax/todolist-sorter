@@ -37,3 +37,49 @@ def test_header_lookup_case_insensitive():
     sig = _sign(secret, body)
     b = TodoistBackend(api_token="t", client_secret=secret)
     assert b.verify_webhook({"x-todoist-hmac-sha256": sig}, body) is True
+
+
+def test_extract_project_id_item_event():
+    b = TodoistBackend(api_token="t", client_secret="s")
+    payload = {
+        "event_name": "item:added",
+        "event_data": {"id": "111", "content": "Apples", "project_id": "999"},
+    }
+    assert b.extract_project_id(payload) == "999"
+
+
+def test_extract_project_id_missing():
+    b = TodoistBackend(api_token="t", client_secret="s")
+    assert b.extract_project_id({"event_name": "item:added"}) is None
+
+
+def test_extract_event_name():
+    b = TodoistBackend(api_token="t", client_secret="s")
+    assert b.extract_event_name({"event_name": "item:updated"}) == "item:updated"
+    assert b.extract_event_name({}) is None
+
+
+def test_extract_item_id():
+    b = TodoistBackend(api_token="t", client_secret="s")
+    payload = {"event_data": {"id": "42"}}
+    assert b.extract_item_id(payload) == "42"
+    assert b.extract_item_id({}) is None
+
+
+def test_extract_trigger_content_on_add_or_update():
+    b = TodoistBackend(api_token="t", client_secret="s")
+    for ev in ("item:added", "item:updated"):
+        payload = {
+            "event_name": ev,
+            "event_data": {"id": "1", "content": "Apples", "project_id": "9"},
+        }
+        assert b.extract_trigger_content(payload) == "Apples"
+
+
+def test_extract_trigger_content_none_for_other_events():
+    b = TodoistBackend(api_token="t", client_secret="s")
+    payload = {
+        "event_name": "item:completed",
+        "event_data": {"id": "1", "content": "Apples", "project_id": "9"},
+    }
+    assert b.extract_trigger_content(payload) is None
