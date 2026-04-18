@@ -1,13 +1,19 @@
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
+
 import pytest
 from pydantic_ai.models.test import TestModel
+from sqlmodel import Session
 
 from app.backends.base import Task
+from app.models import CategoryCache, SortingProject
 from app.sorter import (
     Assignment,
     CategorizedItems,
     categorize,
     compute_reorder,
     render_prompt,
+    sort_project,
     validate_assignments,
 )
 
@@ -125,3 +131,80 @@ def test_compute_reorder_orphans_go_to_end():
         tasks, ["🍎 Fruit"], {"T2": "🍎 Fruit"},
     )
     assert ordered == ["T2", "T1"]
+
+
+@pytest.mark.asyncio
+async def test_sort_project_all_hits_skips_llm(session: Session):
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+    ))
+    session.add(CategoryCache(project_id=pid, content_key="apples",
+                              category_name="🍎 Fruit"))
+    session.add(CategoryCache(project_id=pid, content_key="lettuce",
+                              category_name="🥬 Vegetables"))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Apples"),
+        Task(id="T2", content="Lettuce"),
+    ])
+    backend.reorder = AsyncMock()
+
+    async def _spy(**_):
+        raise AssertionError("LLM should not be called")
+
+    reorder_callback_calls: list[tuple] = []
+
+    def _on_reorder(pid_, ids):
+        reorder_callback_calls.append((pid_, set(ids)))
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_spy, on_reorder=_on_reorder,
+    )
+
+    args = backend.reorder.await_args.args
+    assert args[1] == ["T2", "T1"]
+    assert reorder_callback_calls == [(pid, {"T1", "T2"})]
+
+
+@pytest.mark.asyncio
+async def test_sort_project_partial_miss_calls_llm_and_writes_cache(session: Session):
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+    ))
+    session.add(CategoryCache(project_id=pid, content_key="apples",
+                              category_name="🍎 Fruit"))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Apples"),
+        Task(id="T2", content="Cinnamon"),
+    ])
+    backend.reorder = AsyncMock()
+
+    async def _llm(**kw):
+        assert {t.id for t in kw["misses"]} == {"T2"}
+        return CategorizedItems(assignments=[
+            Assignment(item_id="T2", category_name="🍎 Fruit"),
+        ])
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_llm, on_reorder=lambda p, ids: None,
+    )
+
+    cinnamon = session.get(CategoryCache, (pid, "cinnamon"))
+    assert cinnamon is not None
+    assert cinnamon.category_name == "🍎 Fruit"
+    backend.reorder.assert_awaited_once()
