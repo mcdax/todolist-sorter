@@ -6,6 +6,7 @@ from app.sorter import (
     Assignment,
     CategorizedItems,
     categorize,
+    compute_reorder,
     render_prompt,
     validate_assignments,
 )
@@ -94,3 +95,33 @@ def test_validate_assignments_deduplicates_item_id():
     )
     assert len(valid) == 1
     assert valid[0].category_name == "Fruit"
+
+
+def test_compute_reorder_groups_by_category_preserves_intra_order():
+    tasks = [
+        Task(id="T1", content="Milk"),
+        Task(id="T2", content="Apples"),
+        Task(id="T3", content="Yogurt"),
+        Task(id="T4", content="Lettuce"),
+    ]
+    categories = ["🥬 Vegetables", "🍎 Fruit", "🥛 Dairy"]
+    assignments = {
+        "T1": "🥛 Dairy",
+        "T2": "🍎 Fruit",
+        "T3": "🥛 Dairy",
+        "T4": "🥬 Vegetables",
+    }
+
+    ordered = compute_reorder(tasks, categories, assignments)
+    assert ordered == ["T4", "T2", "T1", "T3"]
+
+
+def test_compute_reorder_orphans_go_to_end():
+    tasks = [
+        Task(id="T1", content="Cinnamon"),
+        Task(id="T2", content="Apples"),
+    ]
+    ordered = compute_reorder(
+        tasks, ["🍎 Fruit"], {"T2": "🍎 Fruit"},
+    )
+    assert ordered == ["T2", "T1"]
