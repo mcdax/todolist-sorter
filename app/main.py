@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.db import create_db_and_tables, get_session, make_engine
 from app.debouncer import ProjectDebouncer
 from app.models import SortingProject
+from app.routes.oauth import build_oauth_router
 from app.routes.projects import build_router as build_projects_router
 from app.routes.providers import build_providers_router
 from app.routes.webhook import build_webhook_router
@@ -117,5 +118,9 @@ def create_app() -> FastAPI:
     app.include_router(build_providers_router(
         api_key=settings.app_api_key,
         registry=registry,
+    ))
+    app.include_router(build_oauth_router(
+        client_id=settings.todoist_client_id,
+        client_secret=settings.todoist_client_secret,
     ))
     return app

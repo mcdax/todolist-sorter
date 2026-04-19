@@ -48,6 +48,7 @@ Copy `.env.example` to `.env` and fill in the values.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `TODOIST_CLIENT_ID` | yes | — | Client ID from the Todoist app console. Used in the OAuth callback to exchange the authorization code for an access token so Todoist marks the app as installed. |
 | `TODOIST_CLIENT_SECRET` | yes | — | Webhook client secret from the Todoist app console. Used to verify the HMAC-SHA256 signature on every incoming webhook. |
 | `TODOIST_API_TOKEN` | yes | — | Personal API token from Todoist settings. Used to fetch tasks and call the Sync API to reorder them. |
 | `LLM_MODEL` | yes | — | pydantic-ai model string, e.g. `anthropic:claude-sonnet-4-6`. |
@@ -109,10 +110,13 @@ In the app console:
 1. Set the **Webhook callback URL** to `https://your-public-host/webhook/todoist`.
    - Local development: expose the service via ngrok, cloudflared, or a similar
      tunnel. The tunnel URL must match exactly what you enter here.
-2. Enable these event types:
+2. Set the **OAuth redirect URL** to `https://your-public-host/oauth/callback`
+   (e.g. `https://todolist-sorter.mcdax.de/oauth/callback`). For local dev use
+   `http://localhost:8000/oauth/callback` via the same tunnel.
+3. Enable these event types:
    - `item:added`
    - `item:updated`
-3. Leave `item:completed` and `item:deleted` disabled — the service does not use
+4. Leave `item:completed` and `item:deleted` disabled — the service does not use
    them.
 
 ### 4. Authorise the app (required for webhook delivery)
@@ -127,9 +131,11 @@ Construct the OAuth URL:
 https://todoist.com/oauth/authorize?client_id=YOUR_CLIENT_ID&scope=data:read_write&state=anything
 ```
 
-Visit the URL in a browser, log in if prompted, and click **Agree**. You do not
-need to handle the redirect or exchange the code for a token — the act of
-authorising registers you as an app user and webhooks start arriving.
+Visit the URL in a browser, log in if prompted, and click **Agree**. Todoist
+will redirect to `https://your-public-host/oauth/callback`, which the service
+handles automatically: it exchanges the code for an access token (completing the
+install flow) and returns a confirmation page. The app then appears in your
+"Installed apps" list and webhooks start arriving.
 
 If webhooks still do not arrive, re-check Todoist's current documentation at
 https://developer.todoist.com/sync/v9/#webhooks — OAuth details may change.

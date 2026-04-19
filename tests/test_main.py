@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 
 def test_healthz(monkeypatch, tmp_path):
     db = tmp_path / "test.db"
+    monkeypatch.setenv("TODOIST_CLIENT_ID", "cid")
     monkeypatch.setenv("TODOIST_CLIENT_SECRET", "s")
     monkeypatch.setenv("TODOIST_API_TOKEN", "t")
     monkeypatch.setenv("LLM_MODEL", "anthropic:claude-sonnet-4-6")
