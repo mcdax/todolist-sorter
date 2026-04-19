@@ -565,3 +565,59 @@ async def test_sort_project_retries_llm_call_once(session: Session):
     # Both items should have been categorized and cached
     assert session.get(CategoryCache, (pid, "apples")) is not None
     assert session.get(CategoryCache, (pid, "lettuce")) is not None
+
+
+@pytest.mark.asyncio
+async def test_sort_project_retry_picks_up_new_items(session: Session):
+    """On retry, the sorter should re-fetch the task list and include any
+    items that were added between attempts."""
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+    ))
+    session.commit()
+
+    # First fetch: 2 items. Second fetch (after the first LLM failure):
+    # an extra item T3 has appeared.
+    fetch_calls = 0
+
+    async def _stateful_get_tasks(_project):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            return [Task(id="T1", content="Apples"),
+                    Task(id="T2", content="Lettuce")]
+        return [Task(id="T1", content="Apples"),
+                Task(id="T2", content="Lettuce"),
+                Task(id="T3", content="Banana")]
+
+    backend = MagicMock()
+    backend.get_tasks = _stateful_get_tasks
+    backend.reorder = AsyncMock()
+
+    seen_misses: list[set[str]] = []
+    llm_calls = 0
+
+    async def _llm(**kw):
+        nonlocal llm_calls
+        llm_calls += 1
+        seen_misses.append({m.content for m in kw["misses"]})
+        if llm_calls == 1:
+            raise RuntimeError("flaky")
+        return CategorizedItems(assignments=[
+            Assignment(item_id=m.id, category_name="🍎 Fruit")
+            for m in kw["misses"]
+        ])
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_llm, on_reorder=lambda p, ids: None,
+    )
+
+    # First attempt saw only {Apples, Lettuce}, retry saw those plus Banana
+    assert seen_misses[0] == {"Apples", "Lettuce"}
+    assert seen_misses[1] == {"Apples", "Lettuce", "Banana"}
+    assert session.get(CategoryCache, (pid, "banana")) is not None

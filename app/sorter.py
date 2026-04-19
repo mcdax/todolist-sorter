@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -151,78 +152,103 @@ async def sort_project(
         log.info("sort aborted: project %s not found or disabled", project_id)
         return
 
-    tasks = await backend.get_tasks(project)
-    if len(tasks) < 2:
-        log.info(
-            "sort aborted: project %r has %d task(s), need at least 2",
-            project.name,
-            len(tasks),
-        )
-        return
-
-    log.info("sort_project start: project=%r total_tasks=%d", project.name, len(tasks))
-
     additional_instructions: str | None = project.additional_instructions or None
 
-    keys = {t.id: _content_key(t.content) for t in tasks}
-    cache_rows = session.exec(
-        select(CategoryCache).where(CategoryCache.project_id == project_id)
-    ).all()
-    # Map content_key -> (category_name, transformed_content)
-    cached: dict[str, tuple[str, str | None]] = {
-        c.content_key: (c.category_name, c.transformed_content) for c in cache_rows
-    }
+    # Retry schedule (seconds before each attempt). The first entry is 0 —
+    # try right away. On any failure we wait the next value and re-fetch
+    # the task list + recompute misses; new items that arrived during the
+    # wait are included in the retried batch.
+    _BACKOFF = (0, 2, 5)
 
     assignments: dict[str, str] = {}
-    # Map task_id -> transformed_content from cache hits
     hit_transformed: dict[str, str | None] = {}
-    hit_contents: dict[str, str] = {}
-    misses: list[Task] = []
-    for t in tasks:
-        k = keys[t.id]
-        if k in cached:
-            cat_name, trans = cached[k]
-            assignments[t.id] = cat_name
-            hit_contents[t.content] = cat_name
-            hit_transformed[t.id] = trans
-            log.info("cache hit: %s → %s", t.content, cat_name)
-        else:
-            misses.append(t)
-
     # Map task_id -> transformed_content from LLM assignments
     llm_transformed: dict[str, str | None] = {}
 
-    if misses:
+    tasks: list[Task] = []
+    logged_start = False
+    logged_hits: set[str] = set()
+
+    for attempt_idx, wait_s in enumerate(_BACKOFF):
+        if wait_s:
+            log.info(
+                "retrying LLM call in %ds (attempt %d/%d)",
+                wait_s, attempt_idx + 1, len(_BACKOFF),
+            )
+            await asyncio.sleep(wait_s)
+
+        tasks = await backend.get_tasks(project)
+        if len(tasks) < 2:
+            log.info(
+                "sort aborted: project %r has %d task(s), need at least 2",
+                project.name,
+                len(tasks),
+            )
+            return
+
+        if not logged_start:
+            log.info("sort_project start: project=%r total_tasks=%d",
+                     project.name, len(tasks))
+            logged_start = True
+
+        # Recompute misses against the current cache + latest task list.
+        keys = {t.id: _content_key(t.content) for t in tasks}
+        cache_rows = session.exec(
+            select(CategoryCache).where(CategoryCache.project_id == project_id)
+        ).all()
+        cached: dict[str, tuple[str, str | None]] = {
+            c.content_key: (c.category_name, c.transformed_content)
+            for c in cache_rows
+        }
+
+        assignments = {}
+        hit_transformed = {}
+        hit_contents: dict[str, str] = {}
+        misses: list[Task] = []
+        for t in tasks:
+            k = keys[t.id]
+            if k in cached:
+                cat_name, trans = cached[k]
+                assignments[t.id] = cat_name
+                hit_contents[t.content] = cat_name
+                hit_transformed[t.id] = trans
+                if t.content not in logged_hits:
+                    log.info("cache hit: %s → %s", t.content, cat_name)
+                    logged_hits.add(t.content)
+            else:
+                misses.append(t)
+
+        if not misses:
+            # Everything resolved — nothing to ask the LLM.
+            break
+
         log.info(
-            "%d item(s) need LLM: %s",
-            len(misses),
+            "%d item(s) need LLM (attempt %d/%d): %s",
+            len(misses), attempt_idx + 1, len(_BACKOFF),
             [m.content for m in misses],
         )
-        result = None
-        for attempt in (1, 2):
-            try:
-                result = await categorize_fn(
-                    model=llm_model,
-                    categories=project.categories,
-                    description=project.description,
-                    hits=hit_contents,
-                    misses=misses,
-                    additional_instructions=additional_instructions,
+        try:
+            result = await categorize_fn(
+                model=llm_model,
+                categories=project.categories,
+                description=project.description,
+                hits=hit_contents,
+                misses=misses,
+                additional_instructions=additional_instructions,
+            )
+        except Exception:
+            if attempt_idx < len(_BACKOFF) - 1:
+                log.warning(
+                    "LLM call failed (attempt %d/%d), will retry",
+                    attempt_idx + 1, len(_BACKOFF), exc_info=True,
                 )
-                break
-            except Exception:
-                if attempt == 1:
-                    log.warning(
-                        "LLM call failed (attempt 1/2), retrying", exc_info=True
-                    )
-                    continue
-                log.exception(
-                    "LLM categorization failed for project %s after 2 attempts",
-                    project_id,
-                )
-                return
-        if result is None:
+                continue
+            log.exception(
+                "LLM categorization failed for project %s after %d attempts",
+                project_id, len(_BACKOFF),
+            )
             return
+
         valid = validate_assignments(
             result,
             categories=project.categories,
@@ -253,6 +279,7 @@ async def sort_project(
             if m.id not in assigned_ids:
                 log.warning("orphan: %s", m.content)
         session.commit()
+        break
 
     current = await backend.get_tasks(project)
     current_ids = {t.id for t in current}
