@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 class Assignment(BaseModel):
     item_id: str
     category_name: str
+    transformed_content: str | None = None
 
 
 class CategorizedItems(BaseModel):
@@ -39,6 +40,7 @@ def render_prompt(
     description: str | None,
     hits: dict[str, str],
     misses: list[Task],
+    additional_instructions: str | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("Categories (in this order):")
@@ -56,6 +58,16 @@ def render_prompt(
     lines.append("Please categorize:")
     for task in misses:
         lines.append(f'  - id={task.id}, content="{task.content}"')
+    if additional_instructions:
+        lines.append("")
+        lines.append(
+            "Additionally, apply the following transformations to each item's content and"
+        )
+        lines.append(
+            "return the new content in the `transformed_content` field. Leave unchanged"
+        )
+        lines.append("if no transformation applies:")
+        lines.append(additional_instructions)
     return "\n".join(lines)
 
 
@@ -66,6 +78,7 @@ async def categorize(
     description: str | None,
     hits: dict[str, str],
     misses: list[Task],
+    additional_instructions: str | None = None,
 ) -> CategorizedItems:
     agent = Agent(
         model,
@@ -77,6 +90,7 @@ async def categorize(
         description=description,
         hits=hits,
         misses=misses,
+        additional_instructions=additional_instructions,
     )
     result = await agent.run(prompt)
     return result.output
@@ -148,23 +162,35 @@ async def sort_project(
 
     log.info("sort_project start: project=%r total_tasks=%d", project.name, len(tasks))
 
+    additional_instructions: str | None = project.additional_instructions or None
+
     keys = {t.id: _content_key(t.content) for t in tasks}
     cache_rows = session.exec(
         select(CategoryCache).where(CategoryCache.project_id == project_id)
     ).all()
-    cached = {c.content_key: c.category_name for c in cache_rows}
+    # Map content_key -> (category_name, transformed_content)
+    cached: dict[str, tuple[str, str | None]] = {
+        c.content_key: (c.category_name, c.transformed_content) for c in cache_rows
+    }
 
     assignments: dict[str, str] = {}
+    # Map task_id -> transformed_content from cache hits
+    hit_transformed: dict[str, str | None] = {}
     hit_contents: dict[str, str] = {}
     misses: list[Task] = []
     for t in tasks:
         k = keys[t.id]
         if k in cached:
-            assignments[t.id] = cached[k]
-            hit_contents[t.content] = cached[k]
-            log.info("cache hit: %s → %s", t.content, cached[k])
+            cat_name, trans = cached[k]
+            assignments[t.id] = cat_name
+            hit_contents[t.content] = cat_name
+            hit_transformed[t.id] = trans
+            log.info("cache hit: %s → %s", t.content, cat_name)
         else:
             misses.append(t)
+
+    # Map task_id -> transformed_content from LLM assignments
+    llm_transformed: dict[str, str | None] = {}
 
     if misses:
         log.info(
@@ -179,6 +205,7 @@ async def sort_project(
                 description=project.description,
                 hits=hit_contents,
                 misses=misses,
+                additional_instructions=additional_instructions,
             )
         except Exception:
             log.exception("LLM categorization failed for project %s", project_id)
@@ -192,9 +219,13 @@ async def sort_project(
         for a in valid:
             assignments[a.item_id] = a.category_name
             miss_content = next(m.content for m in misses if m.id == a.item_id)
+            # Treat empty string as no transformation
+            trans = a.transformed_content if a.transformed_content else None
+            llm_transformed[a.item_id] = trans
             log.info("LLM categorized: %s → %s", miss_content, a.category_name)
             _upsert_cache(session, project_id,
-                          _content_key(miss_content), a.category_name)
+                          _content_key(miss_content), a.category_name,
+                          transformed_content=trans)
         for m in misses:
             if m.id not in assigned_ids:
                 log.warning("orphan: %s", m.content)
@@ -208,22 +239,65 @@ async def sort_project(
     ]
     if len(ordered) < 2:
         return
+
+    # Compute content-update plan (only when additional_instructions is set)
     id_to_content = {t.id: t.content for t in current}
+    content_updates: list[tuple[str, str, str]] = []  # (task_id, old, new)
+    if additional_instructions:
+        for t in current:
+            if t.id not in current_ids:
+                continue
+            # Prefer LLM-derived transformation; fall back to cached hit
+            trans = llm_transformed.get(t.id, hit_transformed.get(t.id))
+            if trans and trans != t.content:
+                content_updates.append((t.id, t.content, trans))
+
+    update_ids = {tid for tid, _, _ in content_updates}
+    affected_ids = list(set(ordered) | update_ids)
+
+    # Mark suppression BEFORE firing writes so webhook echoes get dropped
+    on_reorder(project_id, affected_ids)
+
+    # Issue content updates
+    for task_id, old_content, new_content in content_updates:
+        log.info("will update content: %s %r → %r", task_id, old_content, new_content)
+        try:
+            await backend.update_task_content(project, task_id, new_content)
+        except Exception:
+            log.warning(
+                "failed to update content for task %s, continuing", task_id,
+                exc_info=True,
+            )
+    if content_updates:
+        log.info("updated %d item contents", len(content_updates))
+
     ordered_contents = [id_to_content[tid] for tid in ordered]
     log.info("reordered %d items: %s", len(ordered), ordered_contents)
     await backend.reorder(project, ordered)
-    on_reorder(project_id, ordered)
 
 
 def _upsert_cache(
-    session: Session, project_id: UUID, ckey: str, category_name: str
+    session: Session,
+    project_id: UUID,
+    ckey: str,
+    category_name: str,
+    transformed_content: str | None = None,
 ) -> None:
     existing = session.get(CategoryCache, (project_id, ckey))
     if existing:
+        changed = False
         if existing.category_name != category_name:
             existing.category_name = category_name
+            changed = True
+        if existing.transformed_content != transformed_content:
+            existing.transformed_content = transformed_content
+            changed = True
+        if changed:
             existing.updated_at = datetime.now(timezone.utc)
         return
     session.add(CategoryCache(
-        project_id=project_id, content_key=ckey, category_name=category_name,
+        project_id=project_id,
+        content_key=ckey,
+        category_name=category_name,
+        transformed_content=transformed_content,
     ))

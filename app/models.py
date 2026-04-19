@@ -22,6 +22,7 @@ class SortingProject(SQLModel, table=True):
     provider_config: dict = Field(default_factory=dict, sa_column=Column(JSON))
     categories: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     description: str | None = None
+    additional_instructions: str | None = Field(default=None)
     debounce_seconds: int = 5
     enabled: bool = True
     created_at: datetime = Field(default_factory=_utcnow)
@@ -36,6 +37,7 @@ class CategoryCache(SQLModel, table=True):
     )
     content_key: str = Field(primary_key=True)
     category_name: str
+    transformed_content: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

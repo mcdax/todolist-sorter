@@ -137,6 +137,22 @@ class TodoistBackend:
         return projects
 
     # ------------------------------------------------------------------
+    # Sync API: update task content
+    # ------------------------------------------------------------------
+
+    async def update_task_content(
+        self, project: SortingProject, task_id: str, new_content: str
+    ) -> None:
+        command = {
+            "type": "item_update",
+            "uuid": str(uuid.uuid4()),
+            "args": {"id": task_id, "content": new_content},
+        }
+        async with self._client() as c:
+            r = await c.post(_SYNC_URL, data={"commands": json.dumps([command])})
+            r.raise_for_status()
+
+    # ------------------------------------------------------------------
     # Sync API: reorder tasks
     # ------------------------------------------------------------------
 

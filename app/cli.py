@@ -113,13 +113,15 @@ def list_projects(ctx):
 @click.option("--external-id", default=None, help="External project ID.")
 @click.option("--provider", default="todoist", show_default=True, help="Backend provider.")
 @click.option("--description", default=None, help="Optional description.")
+@click.option("--additional-instructions", default=None,
+              help="Optional free-text instructions for LLM content transformation.")
 @click.option("--debounce-seconds", type=int, default=5, show_default=True,
               help="Debounce delay in seconds.")
 @click.option("--categories-file", default=None, metavar="PATH",
               help="Text file with one category per line.")
 @click.pass_context
-def create_project(ctx, name, external_id, provider, description, debounce_seconds,
-                   categories_file):
+def create_project(ctx, name, external_id, provider, description, additional_instructions,
+                   debounce_seconds, categories_file):
     """Create a new project."""
     with _auth_client(ctx) as client:
         if external_id is None:
@@ -159,6 +161,8 @@ def create_project(ctx, name, external_id, provider, description, debounce_secon
         }
         if description is not None:
             payload["description"] = description
+        if additional_instructions is not None:
+            payload["additional_instructions"] = additional_instructions
 
         r = _handle(client.post("/projects", json=payload))
     _print_json(r.json())
@@ -178,18 +182,24 @@ def show_project(ctx, project_id):
 @click.argument("project_id")
 @click.option("--name", default=None, help="New name.")
 @click.option("--description", default=None, help="New description.")
+@click.option("--additional-instructions", default=None,
+              help="Set additional LLM instructions (pass empty string to clear).")
 @click.option("--enabled/--disabled", "enabled", default=None,
               help="Enable or disable the project.")
 @click.option("--debounce-seconds", type=int, default=None,
               help="New debounce delay in seconds.")
 @click.pass_context
-def update_project(ctx, project_id, name, description, enabled, debounce_seconds):
+def update_project(ctx, project_id, name, description, additional_instructions,
+                   enabled, debounce_seconds):
     """Update a project (only provided fields are changed)."""
     payload = {}
     if name is not None:
         payload["name"] = name
     if description is not None:
         payload["description"] = description
+    if additional_instructions is not None:
+        # Empty string passed from CLI means clear (set to null)
+        payload["additional_instructions"] = additional_instructions if additional_instructions else None
     if enabled is not None:
         payload["enabled"] = enabled
     if debounce_seconds is not None:

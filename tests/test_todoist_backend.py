@@ -177,6 +177,29 @@ async def test_reorder_skips_empty(respx_mock):
 
 
 @pytest.mark.asyncio
+async def test_update_task_content(respx_mock):
+    route = respx_mock.post("https://api.todoist.com/api/v1/sync").mock(
+        return_value=httpx.Response(200, json={"sync_status": {}})
+    )
+    b = TodoistBackend(api_token="tok", client_secret="s")
+    project = SortingProject(
+        name="Lidl", provider="todoist",
+        external_project_id="999", categories=[],
+    )
+
+    await b.update_task_content(project, "task-42", "Fixed typo content")
+
+    assert route.called
+    form = parse_qs(route.calls.last.request.content.decode())
+    commands = _json.loads(form["commands"][0])
+    assert len(commands) == 1
+    cmd = commands[0]
+    assert cmd["type"] == "item_update"
+    assert cmd["args"]["id"] == "task-42"
+    assert cmd["args"]["content"] == "Fixed typo content"
+
+
+@pytest.mark.asyncio
 async def test_get_tasks_paginates(respx_mock):
     route = respx_mock.get("https://api.todoist.com/api/v1/tasks").mock(
         side_effect=[

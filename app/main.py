@@ -10,7 +10,7 @@ from sqlmodel import Session, select
 from app.backends.registry import BackendRegistry
 from app.backends.todoist import TodoistBackend
 from app.config import get_settings
-from app.db import create_db_and_tables, get_session, make_engine
+from app.db import create_db_and_tables, ensure_columns, get_session, make_engine
 from app.debouncer import ProjectDebouncer
 from app.models import SortingProject
 from app.routes.oauth import build_oauth_router
@@ -70,6 +70,7 @@ def create_app() -> FastAPI:
     _export_llm_env(settings.llm_model, settings.llm_api_key, settings.llm_base_url)
     engine = make_engine(settings.database_url)
     create_db_and_tables(engine)
+    ensure_columns(engine)
 
     registry = BackendRegistry()
     registry.register(TodoistBackend(

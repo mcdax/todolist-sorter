@@ -20,12 +20,14 @@ class ProjectCreate(BaseModel):
     external_project_id: str
     categories: list[str] = []
     description: str | None = None
+    additional_instructions: str | None = None
     debounce_seconds: int = 5
 
 
 class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+    additional_instructions: str | None = None
     enabled: bool | None = None
     debounce_seconds: int | None = None
 
@@ -37,6 +39,7 @@ class ProjectOut(BaseModel):
     external_project_id: str
     categories: list[str]
     description: str | None
+    additional_instructions: str | None
     enabled: bool
     debounce_seconds: int
 
@@ -46,6 +49,7 @@ def _out(p: SortingProject) -> ProjectOut:
         id=p.id, name=p.name, provider=p.provider,
         external_project_id=p.external_project_id,
         categories=p.categories, description=p.description,
+        additional_instructions=p.additional_instructions,
         enabled=p.enabled, debounce_seconds=p.debounce_seconds,
     )
 
@@ -69,6 +73,7 @@ def build_router(
             name=body.name, provider=body.provider,
             external_project_id=body.external_project_id,
             categories=body.categories, description=body.description,
+            additional_instructions=body.additional_instructions,
             debounce_seconds=body.debounce_seconds,
         )
         s.add(p)
@@ -101,8 +106,20 @@ def build_router(
         p = s.get(SortingProject, pid)
         if not p:
             raise HTTPException(404)
+        # Detect additional_instructions change (including None↔non-None)
+        ai_in_body = body.model_fields_set
+        instructions_changed = (
+            "additional_instructions" in ai_in_body
+            and body.additional_instructions != p.additional_instructions
+        )
         for k, v in body.model_dump(exclude_none=True).items():
             setattr(p, k, v)
+        # Handle explicit null for additional_instructions (clear it)
+        if "additional_instructions" in ai_in_body and body.additional_instructions is None:
+            p.additional_instructions = None
+        if instructions_changed:
+            _clear_cache(s, pid)
+            on_sort_requested(pid)
         p.updated_at = datetime.now(timezone.utc)
         s.add(p); s.commit(); s.refresh(p)
         return _out(p)

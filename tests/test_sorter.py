@@ -211,6 +211,169 @@ async def test_sort_project_partial_miss_calls_llm_and_writes_cache(session: Ses
     backend.reorder.assert_awaited_once()
 
 
+def test_render_prompt_with_additional_instructions():
+    prompt = render_prompt(
+        categories=["A", "B"],
+        description=None,
+        hits={},
+        misses=[Task(id="1", content="Apples")],
+        additional_instructions="fix obvious typos",
+    )
+    assert "fix obvious typos" in prompt
+    assert "transformed_content" in prompt
+
+
+def test_render_prompt_without_additional_instructions():
+    prompt = render_prompt(
+        categories=["A", "B"],
+        description=None,
+        hits={},
+        misses=[Task(id="1", content="Apples")],
+    )
+    assert "transformed_content" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_sort_project_applies_transformation_and_caches_it(session: Session):
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🍎 Fruit"],
+        additional_instructions="fix obvious typos",
+    ))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Aplles"),
+        Task(id="T2", content="Milk"),
+    ])
+    backend.reorder = AsyncMock()
+    backend.update_task_content = AsyncMock()
+
+    async def _llm(**kw):
+        return CategorizedItems(assignments=[
+            Assignment(item_id="T1", category_name="🍎 Fruit",
+                       transformed_content="Apples"),
+            Assignment(item_id="T2", category_name="🍎 Fruit",
+                       transformed_content=None),
+        ])
+
+    update_calls: list[tuple] = []
+
+    def _on_reorder(pid_, ids):
+        pass
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_llm, on_reorder=_on_reorder,
+    )
+
+    # update_task_content called for T1 (typo fixed), not T2 (no change)
+    backend.update_task_content.assert_awaited_once()
+    call_args = backend.update_task_content.await_args
+    assert call_args.args[1] == "T1"
+    assert call_args.args[2] == "Apples"
+
+    # cache row has transformed_content populated
+    row = session.get(CategoryCache, (pid, "aplles"))
+    assert row is not None
+    assert row.transformed_content == "Apples"
+
+
+@pytest.mark.asyncio
+async def test_sort_project_cached_transformation_applied_on_hit(session: Session):
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🍎 Fruit"],
+        additional_instructions="fix obvious typos",
+    ))
+    session.add(CategoryCache(
+        project_id=pid, content_key="aplles",
+        category_name="🍎 Fruit", transformed_content="Apples",
+    ))
+    session.add(CategoryCache(
+        project_id=pid, content_key="milk",
+        category_name="🍎 Fruit", transformed_content=None,
+    ))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Aplles"),
+        Task(id="T2", content="Milk"),
+    ])
+    backend.reorder = AsyncMock()
+    backend.update_task_content = AsyncMock()
+
+    async def _spy(**_):
+        raise AssertionError("LLM should not be called on full cache hit")
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_spy, on_reorder=lambda p, ids: None,
+    )
+
+    # update_task_content called for T1 (cached transform differs from content)
+    backend.update_task_content.assert_awaited_once()
+    call_args = backend.update_task_content.await_args
+    assert call_args.args[1] == "T1"
+    assert call_args.args[2] == "Apples"
+
+
+@pytest.mark.asyncio
+async def test_sort_project_suppression_covers_updated_ids(session: Session):
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🍎 Fruit", "🥛 Dairy"],
+        additional_instructions="fix typos",
+    ))
+    session.add(CategoryCache(
+        project_id=pid, content_key="aplles",
+        category_name="🍎 Fruit", transformed_content="Apples",
+    ))
+    session.add(CategoryCache(
+        project_id=pid, content_key="milk",
+        category_name="🥛 Dairy", transformed_content=None,
+    ))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Aplles"),
+        Task(id="T2", content="Milk"),
+    ])
+    backend.reorder = AsyncMock()
+    backend.update_task_content = AsyncMock()
+
+    on_reorder_calls: list[tuple] = []
+
+    def _on_reorder(pid_, ids):
+        on_reorder_calls.append((pid_, set(ids)))
+
+    async def _spy(**_):
+        raise AssertionError("LLM should not be called")
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_spy, on_reorder=_on_reorder,
+    )
+
+    assert len(on_reorder_calls) == 1
+    _, affected = on_reorder_calls[0]
+    # Both T1 (content update) and T2 (reorder) should be in affected
+    assert "T1" in affected
+    assert "T2" in affected
+
+
 @pytest.mark.asyncio
 async def test_sort_project_partial_miss_log_records(
     session: Session, caplog: pytest.LogCaptureFixture
