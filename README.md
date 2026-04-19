@@ -40,6 +40,12 @@ The request path for an incoming webhook looks like this:
 - An **LLM provider** key — Anthropic (`claude-sonnet-4-6`) by default; any
   model string supported by pydantic-ai works
 
+### Quickstart
+
+1. `todolist-sorter init` (generates `.env` interactively)
+2. Start the app (`docker compose up -d --build` or `uvicorn app.main:create_app --factory`)
+3. Open `https://your-host/setup` and follow the steps shown
+
 ---
 
 ## Environment variables
@@ -239,6 +245,9 @@ cache show        PROJECT_ID
 cache clear       PROJECT_ID [--yes]
 
 sort              PROJECT_ID           Queue an immediate sort
+
+status                                 Show server setup status (no API key needed)
+init              [--output PATH] [--force]  Generate a .env file interactively
 ```
 
 Full help is available at any level:

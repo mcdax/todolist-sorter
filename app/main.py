@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from uuid import UUID
 
 from fastapi import FastAPI
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.backends.registry import BackendRegistry
 from app.backends.todoist import TodoistBackend
@@ -16,7 +16,13 @@ from app.models import SortingProject
 from app.routes.oauth import build_oauth_router
 from app.routes.projects import build_router as build_projects_router
 from app.routes.providers import build_providers_router
+from app.routes.setup import build_setup_router
 from app.routes.webhook import build_webhook_router
+from app.setup import (
+    compute_setup_status,
+    is_todoist_authorized,
+    resolve_app_api_key,
+)
 from app.sorter import sort_project
 from app.suppression import SuppressionTracker
 
@@ -49,6 +55,8 @@ def create_app() -> FastAPI:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+    # Resolve APP_API_KEY (auto-generate if placeholder or empty)
+    settings.app_api_key = resolve_app_api_key(settings)
     _export_llm_api_key(settings.llm_model, settings.llm_api_key)
     engine = make_engine(settings.database_url)
     create_db_and_tables(engine)
@@ -122,5 +130,17 @@ def create_app() -> FastAPI:
     app.include_router(build_oauth_router(
         client_id=settings.todoist_client_id,
         client_secret=settings.todoist_client_secret,
+        database_url=settings.database_url,
+    ))
+
+    def _get_setup_status(request):
+        with Session(engine) as s:
+            projects_count = len(s.exec(select(SortingProject)).all())
+        authorized = is_todoist_authorized(settings.database_url)
+        return compute_setup_status(request, settings, projects_count, authorized)
+
+    app.include_router(build_setup_router(
+        settings=settings,
+        get_setup_status=_get_setup_status,
     ))
     return app

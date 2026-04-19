@@ -2,11 +2,14 @@ import httpx
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
+from app.setup import mark_todoist_authorized
 
 _TOKEN_URL = "https://todoist.com/oauth/access_token"
 
 
-def build_oauth_router(*, client_id: str, client_secret: str) -> APIRouter:
+def build_oauth_router(
+    *, client_id: str, client_secret: str, database_url: str = "sqlite:///./data/app.db"
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/oauth/callback", response_class=HTMLResponse)
@@ -39,6 +42,8 @@ def build_oauth_router(*, client_id: str, client_secret: str) -> APIRouter:
                 f"<pre>{r.text[:500]}</pre>",
                 status_code=500,
             )
+
+        mark_todoist_authorized(database_url)
 
         return HTMLResponse(
             "<!doctype html><html><head><title>Installed</title>"
