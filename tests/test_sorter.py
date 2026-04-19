@@ -195,8 +195,9 @@ async def test_sort_project_partial_miss_calls_llm_and_writes_cache(session: Ses
 
     async def _llm(**kw):
         assert {t.id for t in kw["misses"]} == {"T2"}
+        # Assign to a different category from T1 so a reorder is required.
         return CategorizedItems(assignments=[
-            Assignment(item_id="T2", category_name="🍎 Fruit"),
+            Assignment(item_id="T2", category_name="🥬 Vegetables"),
         ])
 
     await sort_project(
@@ -207,7 +208,7 @@ async def test_sort_project_partial_miss_calls_llm_and_writes_cache(session: Ses
 
     cinnamon = session.get(CategoryCache, (pid, "cinnamon"))
     assert cinnamon is not None
-    assert cinnamon.category_name == "🍎 Fruit"
+    assert cinnamon.category_name == "🥬 Vegetables"
     backend.reorder.assert_awaited_once()
 
 
@@ -346,9 +347,12 @@ async def test_sort_project_suppression_covers_updated_ids(session: Session):
     session.commit()
 
     backend = MagicMock()
+    # Put Milk (Dairy, idx 1) before Aplles (Fruit, idx 0) so sorting must
+    # reorder — otherwise the "no-op reorder" short-circuit kicks in and
+    # T2 wouldn't appear in the suppression set.
     backend.get_tasks = AsyncMock(return_value=[
-        Task(id="T1", content="Aplles"),
         Task(id="T2", content="Milk"),
+        Task(id="T1", content="Aplles"),
     ])
     backend.reorder = AsyncMock()
     backend.update_task_content = AsyncMock()
@@ -395,7 +399,8 @@ async def test_sort_project_partial_miss_log_records(
     ])
     backend.reorder = AsyncMock()
 
-    llm_category = "🍎 Fruit"
+    # Put T2 in a different category so sorting reorders.
+    llm_category = "🥬 Vegetables"
 
     async def _llm(**kw):
         return CategorizedItems(assignments=[
@@ -432,3 +437,131 @@ async def test_sort_project_partial_miss_log_records(
     # reordered line
     reorder_lines = [m for m in messages if "reordered" in m]
     assert reorder_lines, f"Expected a 'reordered' log line, got messages: {messages}"
+
+
+@pytest.mark.asyncio
+async def test_sort_project_skips_reorder_when_already_sorted(session: Session):
+    """No-op reorder short-circuit: when the current order already matches
+    the computed order, skip the reorder API call entirely."""
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+    ))
+    session.add(CategoryCache(project_id=pid, content_key="lettuce",
+                              category_name="🥬 Vegetables"))
+    session.add(CategoryCache(project_id=pid, content_key="apples",
+                              category_name="🍎 Fruit"))
+    session.commit()
+
+    backend = MagicMock()
+    # Already in correct order (Vegetables before Fruit)
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Lettuce"),
+        Task(id="T2", content="Apples"),
+    ])
+    backend.reorder = AsyncMock()
+
+    async def _llm(**_):
+        raise AssertionError("LLM should not be called; all cache hits")
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_llm, on_reorder=lambda p, ids: None,
+    )
+
+    backend.reorder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sort_project_writes_terminal_cache_for_transformed_form(
+    session: Session,
+):
+    """When the LLM returns a transformation, the cache should have an
+    entry under both the original key AND the transformed key so the
+    echo sort cycle hits cache instead of calling the LLM again."""
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+        additional_instructions="add emoji",
+    ))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="tomatte"),
+        Task(id="T2", content="apples"),
+    ])
+    backend.reorder = AsyncMock()
+    backend.update_task_content = AsyncMock()
+
+    async def _llm(**kw):
+        return CategorizedItems(assignments=[
+            Assignment(item_id="T1", category_name="🥬 Vegetables",
+                       transformed_content="🍅 Tomate"),
+            Assignment(item_id="T2", category_name="🍎 Fruit",
+                       transformed_content="🍎 Apples"),
+        ])
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_llm, on_reorder=lambda p, ids: None,
+    )
+
+    # Original keys cached with transformation
+    tomatte = session.get(CategoryCache, (pid, "tomatte"))
+    assert tomatte is not None
+    assert tomatte.transformed_content == "🍅 Tomate"
+
+    # Terminal keys cached for the transformed form; no further transformation
+    tomate_terminal = session.get(CategoryCache, (pid, "🍅 tomate"))
+    assert tomate_terminal is not None
+    assert tomate_terminal.category_name == "🥬 Vegetables"
+    assert tomate_terminal.transformed_content is None
+
+
+@pytest.mark.asyncio
+async def test_sort_project_retries_llm_call_once(session: Session):
+    """If the first LLM call raises, try a second time before giving up."""
+    pid = uuid4()
+    session.add(SortingProject(
+        id=pid, name="Lidl", provider="todoist",
+        external_project_id="999",
+        categories=["🥬 Vegetables", "🍎 Fruit"],
+    ))
+    session.commit()
+
+    backend = MagicMock()
+    backend.get_tasks = AsyncMock(return_value=[
+        Task(id="T1", content="Apples"),
+        Task(id="T2", content="Lettuce"),
+    ])
+    backend.reorder = AsyncMock()
+
+    calls = 0
+
+    async def _flaky_llm(**kw):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient upstream 400")
+        return CategorizedItems(assignments=[
+            Assignment(item_id="T1", category_name="🍎 Fruit"),
+            Assignment(item_id="T2", category_name="🥬 Vegetables"),
+        ])
+
+    await sort_project(
+        project_id=pid, session=session,
+        backend=backend, llm_model="x",
+        categorize_fn=_flaky_llm, on_reorder=lambda p, ids: None,
+    )
+
+    assert calls == 2
+    # Both items should have been categorized and cached
+    assert session.get(CategoryCache, (pid, "apples")) is not None
+    assert session.get(CategoryCache, (pid, "lettuce")) is not None

@@ -198,17 +198,30 @@ async def sort_project(
             len(misses),
             [m.content for m in misses],
         )
-        try:
-            result = await categorize_fn(
-                model=llm_model,
-                categories=project.categories,
-                description=project.description,
-                hits=hit_contents,
-                misses=misses,
-                additional_instructions=additional_instructions,
-            )
-        except Exception:
-            log.exception("LLM categorization failed for project %s", project_id)
+        result = None
+        for attempt in (1, 2):
+            try:
+                result = await categorize_fn(
+                    model=llm_model,
+                    categories=project.categories,
+                    description=project.description,
+                    hits=hit_contents,
+                    misses=misses,
+                    additional_instructions=additional_instructions,
+                )
+                break
+            except Exception:
+                if attempt == 1:
+                    log.warning(
+                        "LLM call failed (attempt 1/2), retrying", exc_info=True
+                    )
+                    continue
+                log.exception(
+                    "LLM categorization failed for project %s after 2 attempts",
+                    project_id,
+                )
+                return
+        if result is None:
             return
         valid = validate_assignments(
             result,
@@ -226,6 +239,16 @@ async def sort_project(
             _upsert_cache(session, project_id,
                           _content_key(miss_content), a.category_name,
                           transformed_content=trans)
+            # Terminal entry: if the item ever shows up with the transformed
+            # form as content (e.g. after our own content update + echo),
+            # cache hits straight away, no further LLM call, no further
+            # transformation.
+            if trans:
+                trans_key = _content_key(trans)
+                if trans_key != _content_key(miss_content):
+                    _upsert_cache(session, project_id,
+                                  trans_key, a.category_name,
+                                  transformed_content=None)
         for m in misses:
             if m.id not in assigned_ids:
                 log.warning("orphan: %s", m.content)
@@ -237,8 +260,6 @@ async def sort_project(
         tid for tid in compute_reorder(current, project.categories, assignments)
         if tid in current_ids
     ]
-    if len(ordered) < 2:
-        return
 
     # Compute content-update plan (only when additional_instructions is set)
     id_to_content = {t.id: t.content for t in current}
@@ -252,11 +273,19 @@ async def sort_project(
             if trans and trans != t.content:
                 content_updates.append((t.id, t.content, trans))
 
+    current_id_order = [t.id for t in current]
+    needs_reorder = len(ordered) >= 2 and ordered != current_id_order
+
+    if not content_updates and not needs_reorder:
+        log.info("nothing to do: order unchanged, no content updates")
+        return
+
     update_ids = {tid for tid, _, _ in content_updates}
-    affected_ids = list(set(ordered) | update_ids)
+    affected_ids = list((set(ordered) if needs_reorder else set()) | update_ids)
 
     # Mark suppression BEFORE firing writes so webhook echoes get dropped
-    on_reorder(project_id, affected_ids)
+    if affected_ids:
+        on_reorder(project_id, affected_ids)
 
     # Issue content updates
     for task_id, old_content, new_content in content_updates:
@@ -271,9 +300,10 @@ async def sort_project(
     if content_updates:
         log.info("updated %d item contents", len(content_updates))
 
-    ordered_contents = [id_to_content[tid] for tid in ordered]
-    log.info("reordered %d items: %s", len(ordered), ordered_contents)
-    await backend.reorder(project, ordered)
+    if needs_reorder:
+        ordered_contents = [id_to_content[tid] for tid in ordered]
+        log.info("reordered %d items: %s", len(ordered), ordered_contents)
+        await backend.reorder(project, ordered)
 
 
 def _upsert_cache(
