@@ -211,6 +211,24 @@ curl -s -X POST http://localhost:8000/projects \
 
 ---
 
+## OpenAPI spec
+
+A full OpenAPI 3.1 spec is:
+
+- served by the running app at `GET /openapi.json` (FastAPI default)
+- checked in as [`openapi.json`](openapi.json) for offline consumption
+
+Point other LLMs / tool chains at the checked-in file to let them call the
+API correctly without running the server. Regenerate it whenever routes
+change:
+
+```bash
+python scripts/export_openapi.py          # writes ./openapi.json
+python scripts/export_openapi.py --yaml   # writes ./openapi.yaml (needs pyyaml)
+```
+
+---
+
 ## REST API reference
 
 All management endpoints require `X-API-Key: $APP_API_KEY`. The webhook,
