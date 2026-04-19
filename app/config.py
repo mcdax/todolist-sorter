@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     todoist_api_token: str = ""
     llm_model: str = "anthropic:claude-sonnet-4-6"
     llm_api_key: str = ""
+    llm_base_url: str = ""
     app_api_key: str = ""
     database_url: str = "sqlite:///./data/app.db"
     default_debounce_seconds: int = 5
