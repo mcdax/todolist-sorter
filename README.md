@@ -1,739 +1,327 @@
 # todolist-sorter
 
-A self-hosted FastAPI service that listens for Todoist webhooks and automatically
-reorders list items to match a user-defined category order. Add groceries in any
-order; the service sorts them into the route through your store before you arrive.
-Optionally, an LLM-driven transformation layer can fix typos and add emoji to
-the item content on the fly. Designed for a single user running their own instance.
+Add groceries to a Todoist list in any order — the service categorises them
+with an LLM and reorders them to match the route through your supermarket.
+Optionally it also fixes typos and adds emoji to item names. Designed for a
+single person running their own small server.
+
+Example — you add to your Todoist "Shopping" list:
+
+```
+bread
+apples
+5 milch
+toilet paper
+scholle
+```
+
+A few seconds later Todoist shows:
+
+```
+🍎 Apples                  ← fruit, first
+🥖 Bread                   ← bakery
+🐟 Scholle                 ← fish
+🥛 5 Milch                 ← dairy
+🧻 Toilet paper            ← household, last
+```
 
 ---
 
-## Architecture at a glance
+## Before you start
 
-The request path for an incoming webhook looks like this:
+You need:
 
-1. **Webhook received** — `POST /webhook/todoist` verifies the HMAC-SHA256 signature
-   (using `TODOIST_CLIENT_SECRET`). Invalid signatures are rejected with 401.
-2. **Suppression check** — if the event is `item:updated` for an item that was
-   reordered or content-updated within the last `SUPPRESSION_WINDOW_SECONDS`
-   (default 30 s), the event is dropped silently. This prevents echo loops
-   because Todoist fires an `item:updated` event for every item the service
-   reorders or updates.
-3. **Cache fast-path** — the item's content is normalised to a `content_key`
-   (lower-case, whitespace collapsed). If a cache hit is found, the sort is
-   queued immediately (`fire_now`) instead of waiting for the debounce delay.
-4. **Debouncer** — a leading+trailing-edge debouncer collapses bursts of events
-   (e.g. a paste of multiple items) into a single sort run.
-5. **Sort run** — a per-project `asyncio.Lock` serialises concurrent sort
-   requests. Unknown items are sent to the LLM (pydantic-ai) for categorisation
-   and, when `additional_instructions` is set, transformation. Results are
-   written to the cache. Items that cannot be matched to any category are
-   logged at WARNING as orphans.
-6. **Write-back** — content updates (via Sync API `item_update`) and reorder
-   (`item_reorder`) are sent to Todoist. No-op reorders are short-circuited.
-   The affected item IDs are registered in the suppression tracker before the
-   writes so echoes get dropped.
-
-A resilient retry is built in: if the LLM call fails, the service waits up to
-two further intervals (2 s and 5 s) and re-fetches the task list on each retry,
-so items added while the service was backing off are folded into the retried
-batch.
+1. A **Todoist** account — the free plan works.
+2. An **LLM provider API key**. Anthropic (Claude) is the easiest default;
+   Ollama Cloud, OpenAI, Google, Mistral and a few others are supported.
+3. A **server** reachable from the public internet with a **TLS-enabled
+   domain**. Todoist only delivers webhooks over HTTPS. If you do not already
+   have a reverse proxy set up, SWAG / Caddy / Traefik all work; this guide
+   assumes you do.
+4. **Docker + Docker Compose** on that server.
 
 ---
 
-## Prerequisites
+## Step 1 — Create the Todoist app
 
-- **Python 3.11+** (`pyproject.toml` requires `>=3.11`; the Docker image uses 3.12)
-- **SQLite** — no separate database server required
-- A **Todoist** account with API access (see [Todoist setup](#todoist-setup))
-- An **LLM provider** key — Anthropic by default, also Ollama (Cloud), OpenAI,
-  Google, Mistral, Groq, Cohere via pydantic-ai
+Todoist only sends webhooks for users who have installed an "app" and
+authorised it. You create the app once.
 
-### Quickstart
-
-1. `todolist-sorter init` — generate `.env` interactively
-2. `docker compose up -d --build` (or `uvicorn app.main:create_app --factory`)
-3. Open `https://your-host/setup` and follow the on-screen steps (Todoist app
-   creation, webhook registration, OAuth authorisation, first sorting project)
-
----
-
-## Environment variables
-
-Copy `.env.example` to `.env` and fill in the values.
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TODOIST_CLIENT_ID` | yes | — | Client ID from the Todoist app console. Used in the OAuth callback to exchange the authorization code for an access token so Todoist marks the app as installed. |
-| `TODOIST_CLIENT_SECRET` | yes | — | Webhook client secret from the Todoist app console. Used to verify the HMAC-SHA256 signature on every incoming webhook. |
-| `TODOIST_API_TOKEN` | yes | — | Personal API token from Todoist settings. Used to fetch tasks and call the Sync API to reorder/update them. |
-| `LLM_MODEL` | yes | — | pydantic-ai model string. Prefix selects the provider: `anthropic:claude-sonnet-4-6`, `openai:gpt-4o-mini`, `ollama:glm-4.5`, `google:gemini-1.5-pro`, `mistral:mistral-large-latest`, `groq:llama-3.3-70b`, `cohere:command-r-plus`. |
-| `LLM_API_KEY` | yes | — | API key for the LLM provider. Automatically exported to the correct provider env var (e.g. `ANTHROPIC_API_KEY`, `OLLAMA_API_KEY`) on startup. |
-| `LLM_BASE_URL` | no | — | Custom base URL for OpenAI-compatible providers. Set to `https://ollama.com/v1` when `LLM_MODEL=ollama:*` (Ollama Cloud). Ignored for other providers. |
-| `APP_API_KEY` | no | auto-generated | Secret required on management API calls as the `X-API-Key` header. If empty or left at the placeholder value, a 32-byte `secrets.token_urlsafe` is generated on first start and persisted to `<data-dir>/.api_key`. |
-| `DATABASE_URL` | no | `sqlite:///./data/app.db` | SQLAlchemy database URL. The data directory is created on startup. |
-| `DEFAULT_DEBOUNCE_SECONDS` | no | `5` | Seconds to wait after the last webhook event before triggering a sort. |
-| `SUPPRESSION_WINDOW_SECONDS` | no | `30` | Seconds to suppress `item:updated` echo events for items that were just reordered or content-updated. |
-| `LOG_LEVEL` | no | `INFO` | Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
-| `WEBHOOK_DEBUG` | no | unset | When set, a webhook HMAC mismatch is logged at WARNING with the received signature, expected signature, and a body preview. Useful for diagnosing misconfigured client secrets. |
+1. Open <https://developer.todoist.com/appconsole.html>.
+2. Click **Create new app**, name it (e.g. `todolist-sorter`).
+3. Leave the page open — you will come back to it in step 4. For now copy
+   three values into a notepad:
+   - **Client ID**
+   - **Client secret**
+   - Your **personal API token**, which lives on a different page:
+     <https://todoist.com/app/settings/integrations/developer>
 
 ---
 
-## Run locally
+## Step 2 — Deploy the service
+
+### Option A: Docker Compose (recommended)
+
+On your server:
 
 ```bash
-python -m venv .venv
-. .venv/bin/activate
+# 1. Create a working directory
+mkdir -p ~/todolist-sorter && cd ~/todolist-sorter
+
+# 2. Get a compose file
+cat > compose.yaml <<'EOF'
+services:
+  todolist-sorter:
+    image: ghcr.io/mcdax/todolist-sorter:latest
+    container_name: todolist-sorter
+    env_file: [.env]
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+EOF
+
+# 3. Build a .env file
+docker run --rm -it -v "$PWD":/cwd -w /cwd \
+    ghcr.io/mcdax/todolist-sorter:latest \
+    todolist-sorter init --output /cwd/.env
+```
+
+The `init` command prompts for your Todoist values (from step 1) and your
+LLM model + key. It generates a random `APP_API_KEY` for you automatically.
+Accept the defaults where unsure.
+
+Alternatively, copy
+[`.env.example`](.env.example) to `.env` and fill it in by hand.
+
+Start the service:
+
+```bash
+docker compose up -d
+```
+
+### Option B: Run directly with Python
+
+```bash
+git clone https://github.com/mcdax/todolist-sorter.git
+cd todolist-sorter
+python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-
-cp .env.example .env
-# edit .env and fill in all required values
-
-uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
+todolist-sorter init            # interactive .env wizard
+uvicorn app.main:create_app --factory --proxy-headers --forwarded-allow-ips='*'
 ```
-
-The API is now available at `http://localhost:8000`. The interactive docs are at
-`http://localhost:8000/docs`.
-
-When the service is placed behind a reverse proxy that terminates TLS, pass
-`--proxy-headers --forwarded-allow-ips=*` to uvicorn so it trusts the
-`X-Forwarded-Proto` header. The provided `Dockerfile` already does this.
 
 ---
 
-## Run with Docker
+## Step 3 — Expose the service through HTTPS
+
+Point a subdomain (e.g. `sorter.example.com`) at your server and add a
+reverse-proxy config that forwards `/` to `todolist-sorter:8000` (compose)
+or `127.0.0.1:8000` (bare python). See [docs/reverse-proxy-examples.md](docs/reverse-proxy-examples.md)
+if you need templates for nginx / Caddy / SWAG.
+
+Quick check:
 
 ```bash
-docker compose up -d --build
+curl -sS https://sorter.example.com/healthz
+# should print: {"status":"ok"}
 ```
-
-The compose file mounts `./data` into the container so the SQLite database and
-the auto-generated API key persist across restarts. The `.env` file is loaded
-automatically. The container runs uvicorn with `--proxy-headers`, so a reverse
-proxy terminating TLS in front of it (nginx, Caddy, SWAG…) works out of the box.
 
 ---
 
-## Todoist setup
+## Step 4 — Finish the Todoist app
 
-### 1. Create a Todoist app
+Go back to the Todoist developer console and fill in two URLs:
 
-1. Go to https://developer.todoist.com/appconsole.html
-2. Click **Create new app** and give it a name (e.g. `todolist-sorter`).
-3. Note the **Client ID** → `TODOIST_CLIENT_ID` in `.env`.
-4. Note the **Client Secret** → `TODOIST_CLIENT_SECRET` in `.env`.
+- **OAuth redirect URL** → `https://sorter.example.com/oauth/callback`
+- **Webhook callback URL** → `https://sorter.example.com/webhook/todoist`
 
-### 2. Generate a personal API token
+Enable these webhook events (leave the others off):
+- `item:added`
+- `item:updated`
 
-1. Go to https://todoist.com/app/settings/integrations/developer
-2. Copy the token → `TODOIST_API_TOKEN` in `.env`.
-
-### 3. Configure the webhook callback
-
-In the app console:
-
-1. Set the **Webhook callback URL** to `https://your-public-host/webhook/todoist`.
-   Local development: expose the service via ngrok, cloudflared, or similar;
-   the tunnel URL must match exactly what you enter here.
-2. Set the **OAuth redirect URL** to `https://your-public-host/oauth/callback`.
-3. Enable these event types:
-   - `item:added`
-   - `item:updated`
-4. Leave `item:completed` and `item:deleted` disabled — the service does not
-   use them.
-
-### 4. Authorise the app (required for webhook delivery)
-
-Todoist only delivers webhooks for users who have authorised the app via OAuth.
-Open `https://your-host/setup` in a browser and click **Authorize with Todoist**.
-The service builds the OAuth URL from `TODOIST_CLIENT_ID` + the request host and
-handles the redirect at `/oauth/callback` by exchanging the authorization code
-for an access token (which is discarded; the service uses `TODOIST_API_TOKEN`
-for all subsequent Todoist calls).
-
-Once the installed-apps page at https://todoist.com/app/settings/integrations/installed
-lists your app, webhooks start arriving.
-
-### 5. Find your Todoist project ID
-
-Open the project in the Todoist web UI. The URL ends with a numeric id:
-
-```
-https://app.todoist.com/app/project/2345678901
-```
-
-That number is the `external_project_id` you pass when creating a sorting
-project. The CLI can list them interactively; see [Create a sorting project](#create-a-sorting-project).
+Save.
 
 ---
 
-## Create a sorting project
+## Step 5 — Authorise the app
 
-### With the CLI (interactive picker)
+Open **<https://sorter.example.com/setup>** in your browser. The page
+shows which credentials are configured, whether the app is authorised, and
+a big **Authorize with Todoist** button. Click it; Todoist asks you to
+grant access; you land back on `/oauth/callback` with a "✓ App installed"
+message. Webhooks will start arriving now.
 
-Omit `--external-id` and the CLI fetches the available Todoist projects and
-prompts you to pick one:
+If anything is red on that page, fix it and reload.
+
+---
+
+## Step 6 — Create a sorting project
+
+A "sorting project" links one Todoist project to a list of categories in
+the order you want items to appear.
+
+Open `https://sorter.example.com/docs` in your browser — that's the
+interactive Swagger UI. Or use the CLI.
+
+Using the CLI locally (the CLI ships in the same image / package):
 
 ```bash
-export TODOLIST_SORTER_API_KEY=your-app-api-key
+export TODOLIST_SORTER_URL=https://sorter.example.com
+export TODOLIST_SORTER_API_KEY=…           # value from your .env
 
+# List your Todoist projects
+todolist-sorter remote list
+
+# Put your category order into a file (one category per line)
 cat > lidl.txt <<'EOF'
 🥬 Vegetables
 🍎 Fruit
-🍞 Bread
+🥖 Bread
+🐟 Fish
 🥛 Dairy
-🧹 Household
+🧻 Household
 EOF
 
+# Create the sorting project (interactive picker if you omit --external-id)
 todolist-sorter projects create \
-  --name "Lidl Shopping" \
-  --description "Route through the store: entrance → checkout" \
-  --additional-instructions "Fix obvious typos. Prepend a fitting emoji." \
-  --categories-file lidl.txt
+  --name "Lidl" \
+  --categories-file lidl.txt \
+  --additional-instructions "Fix obvious typos. Prepend a fitting emoji."
 ```
 
-### With curl
-
-```bash
-curl -s -X POST http://localhost:8000/projects \
-  -H "X-API-Key: $TODOLIST_SORTER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Lidl Shopping",
-    "provider": "todoist",
-    "external_project_id": "2345678901",
-    "categories": ["🥬 Vegetables", "🍎 Fruit", "🍞 Bread", "🥛 Dairy", "🧹 Household"],
-    "description": "Route through the store: entrance → checkout",
-    "additional_instructions": "Fix obvious typos. Prepend a fitting emoji.",
-    "debounce_seconds": 5
-  }'
-```
+That's it. Add an item to the linked Todoist list and watch it get moved
+into place a few seconds later.
 
 ---
 
-## OpenAPI spec
+## What can I tweak?
 
-A full OpenAPI 3.1 spec is:
-
-- served by the running app at `GET /openapi.json` (FastAPI default)
-- checked in as [`openapi.json`](openapi.json) for offline consumption
-
-Point other LLMs / tool chains at the checked-in file to let them call the
-API correctly without running the server. Regenerate it whenever routes
-change:
-
-```bash
-python scripts/export_openapi.py          # writes ./openapi.json
-python scripts/export_openapi.py --yaml   # writes ./openapi.yaml (needs pyyaml)
-```
-
----
-
-## REST API reference
-
-All management endpoints require `X-API-Key: $APP_API_KEY`. The webhook,
-OAuth callback, health, and setup endpoints are public.
-
-### Data schemas
-
-#### Project
-
-```json
-{
-  "id": "b67d9207-d045-4e52-bdca-9c3961831896",
-  "name": "Lidl Shopping",
-  "provider": "todoist",
-  "external_project_id": "2345678901",
-  "categories": ["🥬 Vegetables", "🍎 Fruit"],
-  "description": "Route through the store: entrance → checkout",
-  "additional_instructions": "Fix obvious typos. Prepend a fitting emoji.",
-  "enabled": true,
-  "debounce_seconds": 5
-}
-```
-
-| Field | Type | Writable? | Notes |
-|---|---|---|---|
-| `id` | UUID | no | Server-assigned. |
-| `name` | string | yes | Free text; for humans. |
-| `provider` | string | on create only | `"todoist"` is the only supported value today. |
-| `external_project_id` | string | on create only | The provider's project id (numeric string for Todoist). Unique per `(provider, external_project_id)`. |
-| `categories` | string[] | via `/categories` endpoints | Ordered. Items are placed in this order; unknown items sort to the end. |
-| `description` | string \| null | yes | Free-text context for the LLM (e.g. which store this is). |
-| `additional_instructions` | string \| null | yes | Optional prompt extension telling the LLM to also transform the item content (fix typos, add emoji, …). Writing this field through `PUT /projects/{id}` clears the project's cache and triggers a sort. |
-| `enabled` | boolean | yes | Disabled projects ignore incoming webhooks. |
-| `debounce_seconds` | int | yes | Overrides `DEFAULT_DEBOUNCE_SECONDS` for this project. |
-
-#### CacheEntry
-
-```json
-{
-  "content_key": "äpfel",
-  "category_name": "🍎 Fruit",
-  "transformed_content": "🍎 Äpfel"
-}
-```
-
-`transformed_content` is `null` unless `additional_instructions` is set for
-the project. When the LLM produces a transformation, the service writes two
-cache rows: one keyed on the normalised original, one keyed on the normalised
-transformed form (with `transformed_content=null`) to prevent a second LLM
-call when the echo of our own update comes back.
-
----
-
-### Health
-
-#### `GET /healthz`
-
-Liveness probe.
-
-Response `200`:
-```json
-{"status": "ok"}
-```
-
----
-
-### Setup
-
-#### `GET /setup`
-
-Self-service HTML page that:
-- Lists each required credential with a ✓/✗ status
-- Shows the expected OAuth redirect URI (built from the request host)
-- Renders an **Authorize with Todoist** button linking to the authorize URL
-- Displays the number of configured sorting projects
-
-Useful as a first-run landing page. No auth required.
-
-#### `GET /setup/status`
-
-JSON version of the same information. No auth required.
-
-Response `200`:
-```json
-{
-  "credentials": {
-    "todoist_client_id":     {"set": true, "placeholder": false},
-    "todoist_client_secret": {"set": true, "placeholder": false},
-    "todoist_api_token":     {"set": true, "placeholder": false},
-    "llm_api_key":           {"set": true, "placeholder": false},
-    "app_api_key":           {"set": true, "placeholder": false, "auto_generated": true}
-  },
-  "todoist_authorized": true,
-  "projects_count": 1,
-  "llm_model": "anthropic:claude-sonnet-4-6",
-  "oauth": {
-    "authorize_url": "https://todoist.com/oauth/authorize?client_id=...&scope=data:read_write&state=setup&redirect_uri=...",
-    "redirect_uri": "https://your-host/oauth/callback",
-    "redirect_uri_matches": true
-  }
-}
-```
-
-The CLI `todolist-sorter status` consumes this endpoint.
-
----
-
-### OAuth
-
-#### `GET /oauth/callback`
-
-Target of the Todoist OAuth redirect. Expects `code` and optionally `state`.
-
-Query params: `code`, `state`, `error`, `error_description`.
-
-| Scenario | Response |
+| In `.env` | What it does |
 |---|---|
-| `error=…` present | `400`, HTML body containing the error |
-| `code` missing | `400`, HTML body |
-| Code exchange with Todoist returns non-2xx | `500`, HTML with the response body |
-| Successful code exchange | `200`, HTML "App installed" + marker file `<data-dir>/.todoist_authorized` written |
+| `LLM_MODEL` | e.g. `anthropic:claude-sonnet-4-6`, `ollama:glm-4.5`, `openai:gpt-4o-mini`. |
+| `LLM_BASE_URL` | Only needed for OpenAI-compatible endpoints like Ollama Cloud (`https://ollama.com/v1`). |
+| `DEFAULT_DEBOUNCE_SECONDS` | How long to wait after the last change before sorting. Default 5. |
+| `SUPPRESSION_WINDOW_SECONDS` | How long to ignore the webhook echoes of our own reorder. Default 30. |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default `INFO`. |
+
+Per project (via `PUT /projects/{id}` or the CLI's `projects update`):
+- `additional_instructions` — free text the LLM uses when rewriting item
+  content. Set it to `"Fix obvious typos. Prepend a fitting emoji."` for
+  the shown behaviour.
+- `debounce_seconds` — overrides the global default for this project.
+- `enabled` — set to `false` to pause sorting without deleting the project.
+
+Managing categories after the fact:
+```bash
+todolist-sorter categories list   <project-id>
+todolist-sorter categories add    <project-id> "🧊 Frozen" --at-index 5
+todolist-sorter categories rename <project-id> 5 "❄ Frozen"
+todolist-sorter categories move   <project-id> 5 --to 7
+todolist-sorter categories remove <project-id> 5
+```
 
 ---
 
-### Providers (remote-side queries)
+## API reference
 
-#### `GET /providers/{provider}/projects`
+The API is documented via OpenAPI / Swagger, not in this README:
 
-Lists the remote provider's projects (for Todoist, every accessible project
-under the configured API token). Used by the CLI's interactive picker.
+- **Interactive docs**: `https://<your-host>/docs` (Swagger UI) or `/redoc`.
+- **Raw OpenAPI spec**: `https://<your-host>/openapi.json`.
+- **Versioned copy in this repo**: [`openapi.json`](openapi.json).
 
-Path params:
-- `provider` — `"todoist"` (only supported value today)
+All management endpoints (everything except `/healthz`, `/webhook/*`,
+`/oauth/callback`, and the setup page) require an `X-API-Key: <APP_API_KEY>`
+header.
 
-Response `200`:
-```json
-[
-  {"id": "6GpggJhGW2xM5g3F", "name": "Einkaufsliste"},
-  {"id": "6MxG5GxwMX3qx8rJ", "name": "Gemeinsam"}
-]
-```
-
-Error: `404` if `provider` unknown.
-
----
-
-### Projects CRUD
-
-#### `GET /projects`
-
-List sorting projects. Returns `Project[]`.
-
-#### `POST /projects`
-
-Create a sorting project.
-
-Request body:
-```json
-{
-  "name": "Lidl Shopping",
-  "provider": "todoist",
-  "external_project_id": "2345678901",
-  "categories": ["🥬 Vegetables", "🍎 Fruit"],
-  "description": "optional",
-  "additional_instructions": "optional",
-  "debounce_seconds": 5
-}
-```
-
-| Field | Type | Required |
-|---|---|---|
-| `name` | string | yes |
-| `provider` | string | yes |
-| `external_project_id` | string | yes |
-| `categories` | string[] | no (default `[]`) |
-| `description` | string \| null | no |
-| `additional_instructions` | string \| null | no |
-| `debounce_seconds` | int | no (default `5`) |
-
-Responses:
-- `201` — `Project` JSON
-- `409` — Duplicate `(provider, external_project_id)`; body `{"detail": "..."}`
-- `401` — Missing or wrong `X-API-Key`
-
-#### `GET /projects/{id}`
-
-Returns `Project`. `404` if not found.
-
-#### `PUT /projects/{id}`
-
-Partial update. Only fields provided in the body are modified.
-
-Request body (all fields optional):
-```json
-{
-  "name": "…",
-  "description": "…",
-  "additional_instructions": "…",
-  "enabled": true,
-  "debounce_seconds": 10
-}
-```
-
-Behaviour:
-- Changing `additional_instructions` (incl. `null ↔ value`) clears the project's
-  cache and triggers a sort.
-- Other field changes do not touch the cache.
-
-Responses:
-- `200` — updated `Project`
-- `404` — project not found
-
-#### `DELETE /projects/{id}`
-
-Deletes the project and (via `ON DELETE CASCADE`) all its `CategoryCache` rows.
-
-Responses:
-- `204` — deleted
-- `404` — project not found
-
-#### `POST /projects/{id}/sort`
-
-Manually trigger a sort cycle, bypassing the debounce.
-
-Responses:
-- `202` — `{"status": "queued"}`
-- `404` — project not found
-
----
-
-### Categories
-
-All category endpoints operate on a specific project's `categories` list and
-trigger a sort after the modification. Indices are **0-based**.
-
-#### `GET /projects/{id}/categories`
-
-Returns `string[]` — the current ordered list.
-
-#### `PUT /projects/{id}/categories`
-
-Atomic full replace.
-
-Request body:
-```json
-{"categories": ["🥬 Vegetables", "🍎 Fruit", "🍞 Bread"]}
-```
-
-Cache impact: if the new list introduces any name not present before (add or
-rename), the full project cache is cleared; otherwise only the rows for removed
-category names are deleted.
-
-Response `200`: the new category list.
-
-#### `POST /projects/{id}/categories`
-
-Insert a category.
-
-Request body:
-```json
-{"name": "🧊 Frozen", "at_index": 5}
-```
-
-`at_index` is optional (default: append). Must be in `[0, len]` or `422`.
-
-Cache impact: full clear (a new category may better fit existing items).
-
-Response `200`: the updated list.
-
-#### `DELETE /projects/{id}/categories/{index}`
-
-Remove by index. Cache impact: only rows for the removed category name are
-deleted.
-
-Response `200`: the updated list. `422` if `index` out of range.
-
-#### `PATCH /projects/{id}/categories/{index}`
-
-Rename and/or move a category in one call.
-
-Request body (either or both):
-```json
-{"name": "New name", "move_to": 3}
-```
-
-Cache impact:
-- rename (`name` changes) → full cache clear (rename may change semantics)
-- move-only (`name` omitted or unchanged) → cache untouched
-
-Responses:
-- `200` — updated list
-- `422` — index or `move_to` out of range
-
----
-
-### Cache
-
-#### `GET /projects/{id}/cache`
-
-Dump the project's cache.
-
-Response `200`:
-```json
-[
-  {"content_key": "äpfel", "category_name": "🍎 Fruit", "transformed_content": "🍎 Äpfel"},
-  {"content_key": "milch", "category_name": "🥛 Dairy", "transformed_content": null}
-]
-```
-
-#### `DELETE /projects/{id}/cache`
-
-Clear all cache rows for the project. The next sort re-queries the LLM for
-every item.
-
-Response: `204`.
-
----
-
-### Webhook
-
-#### `POST /webhook/{provider}`
-
-Provider-specific event endpoint. For `provider=todoist`:
-
-- Header `X-Todoist-Hmac-SHA256` is required; the body is verified against
-  `TODOIST_CLIENT_SECRET`.
-- Handles the event types `item:added` and `item:updated`.
-
-Response `200`:
-```json
-{"status": "queued"}     // event accepted, sort scheduled
-{"status": "ignored"}    // unknown project or missing project_id
-{"status": "suppressed"} // echo of a just-performed reorder/update
-```
-
-Errors:
-- `401` — invalid signature
-- `404` — unknown provider
-- `400` — invalid JSON body
-
-The endpoint returns `200` even for "ignored" / "suppressed" so Todoist does
-not retry.
-
----
-
-## CLI reference
-
-The `todolist-sorter` CLI wraps the REST API.
-
-| Variable | Option | Description |
-|---|---|---|
-| `TODOLIST_SORTER_URL` | `--url` | Server base URL. Default: `http://localhost:8000`. |
-| `TODOLIST_SORTER_API_KEY` | `--api-key` | API key (`X-API-Key`). Required by commands that hit management endpoints; `status` and `init` do not need it. |
-
-### Commands
-
-```
-projects list                                List all projects
-projects create   [--name] [--external-id] [--provider todoist]
-                  [--description] [--additional-instructions]
-                  [--debounce-seconds] [--categories-file]
-                  # Omit --external-id for the interactive picker
-projects show     PROJECT_ID                 Print project details as JSON
-projects update   PROJECT_ID [--name] [--description]
-                  [--additional-instructions] [--enabled|--disabled]
-                  [--debounce-seconds]
-projects delete   PROJECT_ID [--yes]
-
-categories list   PROJECT_ID
-categories add    PROJECT_ID NAME [--at-index]
-categories remove PROJECT_ID INDEX
-categories rename PROJECT_ID INDEX NEW_NAME
-categories move   PROJECT_ID INDEX --to TARGET_INDEX
-categories replace PROJECT_ID CATEGORIES_FILE
-
-cache show        PROJECT_ID
-cache clear       PROJECT_ID [--yes]
-
-sort              PROJECT_ID                 Queue an immediate sort
-
-remote list       [--provider todoist]       List the provider's remote projects
-
-status                                       Show server setup status (no API key needed)
-init              [--output PATH] [--force]  Generate a .env file interactively
-```
-
-Help is available at any level:
+Quick curl examples:
 
 ```bash
-todolist-sorter --help
-todolist-sorter projects --help
+# List sorting projects
+curl -H "X-API-Key: $TODOLIST_SORTER_API_KEY" https://sorter.example.com/projects
+
+# Trigger a manual re-sort
+curl -X POST -H "X-API-Key: $TODOLIST_SORTER_API_KEY" \
+    https://sorter.example.com/projects/<uuid>/sort
+```
+
+To regenerate the checked-in OpenAPI file after changing routes:
+
+```bash
+python scripts/export_openapi.py
 ```
 
 ---
 
-## Observability
-
-The service logs at INFO level for each sort cycle:
+## How it works (one level deeper)
 
 ```
-sort_project start: project='Lidl' total_tasks=8
-cache hit: Apples → 🍎 Fruit
-2 item(s) need LLM (attempt 1/3): ['Cinnamon', 'Oats']
-LLM categorized: Cinnamon → 🥬 Spices
-LLM categorized: Oats → 🥜 Nüsse & Trockenfrüchte
-will update content: 6gQ... 'oats' → '🥜 Oats'
-updated 1 item contents
-reordered 8 items: ['🥬 Broccoli', '🍎 Apples', ...]
+Todoist webhook → HMAC check → suppression check → cache fast-path
+    → debouncer (collapses bursts)
+    → sort cycle (locked per project):
+        fetch tasks
+        cache lookup; miss list → LLM (retry 0s / 2s / 5s, re-fetching on retry)
+        write back transformed content (if additional_instructions is set)
+        reorder via Sync API (skipped if current order already matches)
+        mark suppression for all written item ids
 ```
 
-When nothing changed (echo events after our own reorder):
+`openapi.json` + [`app/`](app/) are the source of truth; this description
+is just a mental model. Notable design choices:
 
-```
-sort_project start: project='Lidl' total_tasks=8
-nothing to do: order unchanged, no content updates
-```
-
-Items the LLM cannot assign to any category are logged at WARNING as
-`orphan: <content>` and placed at the end of the list.
-
-When the LLM call fails, the service retries up to two further times with
-a 2 s / 5 s backoff. Each retry re-fetches the task list so items added in
-the meantime are folded into the retried batch.
-
----
-
-## Notes on content handling
-
-### `additional_instructions`
-
-When set on a project, the LLM is asked to return a `transformed_content`
-alongside the category for each miss. The service writes both back to
-Todoist (`item_update`) and caches them. Typical prompts:
-
-- `Fix obvious typos. Prepend a fitting emoji if none is present.`
-- `Normalise German capitalisation. Keep brand names untouched.`
-
-Changing `additional_instructions` via `PUT /projects/{id}` clears the
-project's cache so everything is re-evaluated under the new instructions.
-
-### Quantity prefixes (`5 Milch`, `500g Mehl`)
-
-Quantities are handled end-to-end: the LLM categorises `5 Milch` as Dairy,
-and with `additional_instructions` it typically transforms to `🥛 5 Milch`.
-Each distinct quantity produces its own cache entry because the normalised
-content key includes the leading number. This is fine for correctness but
-not deduplicating across quantities — adding `5 Milch` and later `3 Milch`
-are two LLM calls, not one.
+- A **cache** keyed on the lower-cased item content maps each known item
+  to its category. Most items are resolved without touching the LLM.
+- When `additional_instructions` is set, the cache also stores the
+  transformed form under its own key so the webhook echo of our own
+  content update is a cache hit, not a second LLM call.
+- The **suppression tracker** drops `item:updated` events for items the
+  service just wrote to, preventing echo loops.
+- A **per-project `asyncio.Lock`** keeps concurrent sort cycles from
+  stepping on each other.
 
 ---
 
 ## Troubleshooting
 
-### Webhooks are not arriving
+**`/setup` shows red entries** — follow the on-screen guidance. It is the
+diagnostic dashboard; nothing in the logs will ever tell you more than
+this page.
 
-Run `todolist-sorter status` (or open `/setup`) to diagnose:
+**Webhooks are not arriving** — check the Todoist app console for the
+`item:added` / `item:updated` events, confirm the callback URL is
+reachable over HTTPS, and that you completed step 5. Set `WEBHOOK_DEBUG=1`
+in `.env` to log the received vs expected HMAC on every failure.
 
-- Confirm the callback URL in the Todoist app console is publicly reachable
-  and matches exactly (scheme, host, path).
-- Confirm `TODOIST_CLIENT_SECRET` matches the Client Secret in the app
-  console. Set `WEBHOOK_DEBUG=1` to log the received vs expected HMAC on
-  mismatch.
-- Confirm you have authorised the app via `/setup` — Todoist will not
-  deliver webhooks until the OAuth exchange has completed.
-- Confirm `item:added` and `item:updated` are enabled in the app console.
+**`401` on every API call** — the `X-API-Key` header must match
+`APP_API_KEY` exactly. If you left the placeholder in `.env`, the service
+auto-generates one and logs it as `WARNING Auto-generated APP_API_KEY:
+<key>` on first boot. The value is persisted in `<data-dir>/.api_key`.
 
-### 401 on all management API calls
+**Webhook responded `"status": "suppressed"`** — this is normal
+immediately after a reorder. The service is ignoring its own echo events.
+Wait `SUPPRESSION_WINDOW_SECONDS` (30 s by default) and try again.
 
-The `X-API-Key` header value must match `APP_API_KEY` exactly. When `APP_API_KEY`
-is empty or a placeholder, the service auto-generates a key on first start
-and logs it once as:
+**LLM call times out or returns 500** — the service retries automatically
+(`0 s / 2 s / 5 s` backoff). If it gives up after three attempts, the
+next webhook event will re-trigger. Persistent failures usually mean a
+wrong `LLM_MODEL` string, expired `LLM_API_KEY`, or unreachable
+`LLM_BASE_URL`. Check the logs for `LLM categorization failed`.
 
+**Items do not re-sort after renaming a category** — renaming clears the
+whole project's cache and kicks off a new sort. If nothing happens,
+confirm the project is `enabled=true` (visible on `/setup` or via
+`projects show`) and that the Todoist list has at least two items.
+
+---
+
+## Running tests
+
+```bash
+pip install -e '.[dev]'
+pytest
 ```
-WARNING Auto-generated APP_API_KEY: <key> (saved to ./data/.api_key)
-```
 
-Copy that key into `TODOLIST_SORTER_API_KEY`. The key is persisted to
-`<data-dir>/.api_key` and reused across restarts.
-
-### Webhook response shows `"status": "suppressed"`
-
-Normal immediately after a reorder or content update. The suppression
-window drops `item:updated` echoes for just-written items. Normal
-processing resumes after `SUPPRESSION_WINDOW_SECONDS`.
-
-### Items do not re-sort after renaming a category
-
-Renaming a category clears the full cache for the project; the next sort
-run re-categorises all items from scratch. If sorting still does not
-happen:
-
-- `projects show <uuid>` — confirm the project is `enabled=true`.
-- Confirm the Todoist project has at least two items (a single-item list
-  cannot be reordered).
-
-### LLM call keeps timing out
-
-The LLM call runs with the HTTP client's own timeouts; on top of that,
-the service retries twice with 2 s / 5 s backoff. Persistent failures
-indicate a config problem (wrong model string, wrong `LLM_BASE_URL`,
-expired key) rather than flakiness. Check the logs for
-`LLM categorization failed for project ... after 3 attempts`.
-
-### `LLM_API_KEY` error on startup
-
-The `Settings` class only soft-validates credentials — missing values
-produce 500s later, not an immediate crash. Use `/setup` to confirm
-every required variable has a non-placeholder value.
+183 tests covering the HTTP layer, the sort pipeline, the debouncer /
+suppression / retry logic, and the CLI.
