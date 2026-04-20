@@ -16,7 +16,21 @@ def build_providers_router(
         dependencies=[Depends(require_api_key(api_key))],
     )
 
-    @router.get("/{provider}/projects", response_model=list[ProviderProject])
+    @router.get(
+        "/{provider}/projects",
+        response_model=list[ProviderProject],
+        summary="List remote provider-side projects",
+        description=(
+            "Calls the provider's API (e.g. Todoist) to enumerate every "
+            "project the configured credentials can access. Used by the "
+            "CLI's interactive `projects create` picker so users don't "
+            "have to copy the numeric project id by hand."
+        ),
+        responses={
+            200: {"description": "List of remote projects."},
+            404: {"description": "Unknown provider id in URL path."},
+        },
+    )
     async def list_remote_projects(provider: str):
         try:
             backend = registry.get(provider)

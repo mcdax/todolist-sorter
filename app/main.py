@@ -115,9 +115,35 @@ def create_app() -> FastAPI:
     async def lifespan(_app: FastAPI):
         yield
 
-    app = FastAPI(title="Todolist Sorter", lifespan=lifespan)
+    app = FastAPI(
+        title="Todolist Sorter",
+        version="0.1.0",
+        description=(
+            "Self-hosted service that watches a Todoist project for new "
+            "items and reorders them into a user-defined category "
+            "sequence using an LLM. Optionally also transforms item "
+            "content (typo fixes, emoji) based on per-project "
+            "`additional_instructions`.\n\n"
+            "**Auth.** Management endpoints require an `X-API-Key: "
+            "<APP_API_KEY>` header. The webhook, OAuth callback, "
+            "health probe, and `/setup` pages are public.\n\n"
+            "First-time setup: open `/setup` in a browser."
+        ),
+        contact={
+            "name": "Source on GitHub",
+            "url": "https://github.com/mcdax/todolist-sorter",
+        },
+        license_info={"name": "MIT"},
+        lifespan=lifespan,
+    )
 
-    @app.get("/healthz")
+    @app.get(
+        "/healthz",
+        tags=["health"],
+        summary="Liveness probe",
+        description="Returns `{\"status\":\"ok\"}` if the process is up. "
+                    "Does not touch the database or any external service.",
+    )
     def health():
         return {"status": "ok"}
 

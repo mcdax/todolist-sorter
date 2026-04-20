@@ -2,12 +2,24 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Todolist Sorter",
+    "description": "Self-hosted service that watches a Todoist project for new items and reorders them into a user-defined category sequence using an LLM. Optionally also transforms item content (typo fixes, emoji) based on per-project `additional_instructions`.\n\n**Auth.** Management endpoints require an `X-API-Key: <APP_API_KEY>` header. The webhook, OAuth callback, health probe, and `/setup` pages are public.\n\nFirst-time setup: open `/setup` in a browser.",
+    "contact": {
+      "name": "Source on GitHub",
+      "url": "https://github.com/mcdax/todolist-sorter"
+    },
+    "license": {
+      "name": "MIT"
+    },
     "version": "0.1.0"
   },
   "paths": {
     "/healthz": {
       "get": {
-        "summary": "Health",
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness probe",
+        "description": "Returns `{\"status\":\"ok\"}` if the process is up. Does not touch the database or any external service.",
         "operationId": "health_healthz_get",
         "responses": {
           "200": {
@@ -26,7 +38,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Create",
+        "summary": "Create a sorting project",
+        "description": "Register a new sorting project that links one provider-side project (e.g. a Todoist project) to an ordered list of categories. Returns the created project including its UUID. Responds with 409 if a project with the same `(provider, external_project_id)` already exists.",
         "operationId": "create_projects_post",
         "parameters": [
           {
@@ -83,7 +96,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "List ",
+        "summary": "List all sorting projects",
+        "description": "Returns every registered sorting project, unpaginated.",
         "operationId": "list__projects_get",
         "parameters": [
           {
@@ -136,7 +150,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Get",
+        "summary": "Get a sorting project by id",
+        "description": "Fetches a single project by its UUID. 404 if not found.",
         "operationId": "get_projects__pid__get",
         "parameters": [
           {
@@ -193,7 +208,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Update",
+        "summary": "Update a sorting project (partial)",
+        "description": "Partial update — only fields present in the body are changed. Changing `additional_instructions` (including null↔value) clears the project's entire cache and triggers a re-sort so every item is re-evaluated under the new instructions.",
         "operationId": "update_projects__pid__put",
         "parameters": [
           {
@@ -260,7 +276,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Delete",
+        "summary": "Delete a sorting project",
+        "description": "Delete a project and all of its `CategoryCache` rows (via `ON DELETE CASCADE`). Returns 204 on success, 404 if the project does not exist.",
         "operationId": "delete_projects__pid__delete",
         "parameters": [
           {
@@ -312,7 +329,7 @@
         "tags": [
           "projects"
         ],
-        "summary": "List Categories",
+        "summary": "List a project's categories in order",
         "operationId": "list_categories_projects__pid__categories_get",
         "parameters": [
           {
@@ -373,7 +390,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Replace Categories",
+        "summary": "Replace a project's category list atomically",
+        "description": "Replaces the entire category list in one call. Cache invalidation depends on the diff: any added name → full clear; pure removals → delete only the rows for removed names; pure reorders → cache untouched. Returns the new list.",
         "operationId": "replace_categories_projects__pid__categories_put",
         "parameters": [
           {
@@ -444,7 +462,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Add Category",
+        "summary": "Insert one category into a project's list",
+        "description": "Insert a new category at the given 0-based index (or at the end if `at_index` is omitted). The full project cache is cleared because a newly added category may better fit existing items; the service then triggers a re-sort.",
         "operationId": "add_category_projects__pid__categories_post",
         "parameters": [
           {
@@ -517,7 +536,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Remove Category",
+        "summary": "Remove a category by index",
+        "description": "Remove the category at the given 0-based index. Only the cache rows for the removed name are deleted; the rest of the cache is preserved. Triggers a re-sort.",
         "operationId": "remove_category_projects__pid__categories__index__delete",
         "parameters": [
           {
@@ -587,7 +607,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Patch Category",
+        "summary": "Rename and/or move a category",
+        "description": "Both `name` and `move_to` are optional. Rename clears the full project cache (a rename can change semantics); a pure move does not touch the cache. Triggers a re-sort in both cases.",
         "operationId": "patch_category_projects__pid__categories__index__patch",
         "parameters": [
           {
@@ -669,7 +690,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Get Cache",
+        "summary": "Inspect a project's LLM-result cache",
+        "description": "Returns every cached entry for the project. Useful for debugging misclassifications.",
         "operationId": "get_cache_projects__pid__cache_get",
         "parameters": [
           {
@@ -704,7 +726,13 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CacheEntry"
+                  },
+                  "title": "Response Get Cache Projects  Pid  Cache Get"
+                }
               }
             }
           },
@@ -724,7 +752,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Clear Cache",
+        "summary": "Clear a project's LLM cache",
+        "description": "Drops every cached entry for the project so the next sort re-queries the LLM for every item.",
         "operationId": "clear_cache_projects__pid__cache_delete",
         "parameters": [
           {
@@ -776,7 +805,8 @@
         "tags": [
           "projects"
         ],
-        "summary": "Trigger Sort",
+        "summary": "Queue an immediate sort",
+        "description": "Bypasses the debouncer and schedules a sort cycle for the project right away. Response is returned before the sort runs; use `/healthz` + container logs to observe progress.",
         "operationId": "trigger_sort_projects__pid__sort_post",
         "parameters": [
           {
@@ -830,7 +860,11 @@
     },
     "/webhook/{provider}": {
       "post": {
-        "summary": "Receive",
+        "tags": [
+          "webhook"
+        ],
+        "summary": "Provider webhook receiver",
+        "description": "Receives webhook events from a task provider (currently `todoist`). Verifies the provider-specific signature (`X-Todoist-Hmac-SHA256` for Todoist), parses the event body, and either schedules a sort (via the debouncer) or drops the event with status `ignored` / `suppressed`. Always responds 200 with a JSON `{status: ...}` body so the provider will not retry.",
         "operationId": "receive_webhook__provider__post",
         "parameters": [
           {
@@ -845,12 +879,21 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Event accepted. `queued` = sort scheduled; `ignored` = unknown project / no project id in payload; `suppressed` = echo of an item the service just wrote to itself.",
             "content": {
               "application/json": {
                 "schema": {}
               }
             }
+          },
+          "400": {
+            "description": "Invalid JSON body."
+          },
+          "401": {
+            "description": "Signature verification failed."
+          },
+          "404": {
+            "description": "Unknown provider id in URL path."
           },
           "422": {
             "description": "Validation Error",
@@ -870,7 +913,8 @@
         "tags": [
           "providers"
         ],
-        "summary": "List Remote Projects",
+        "summary": "List remote provider-side projects",
+        "description": "Calls the provider's API (e.g. Todoist) to enumerate every project the configured credentials can access. Used by the CLI's interactive `projects create` picker so users don't have to copy the numeric project id by hand.",
         "operationId": "list_remote_projects_providers__provider__projects_get",
         "parameters": [
           {
@@ -901,7 +945,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "List of remote projects.",
             "content": {
               "application/json": {
                 "schema": {
@@ -913,6 +957,9 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Unknown provider id in URL path."
           },
           "422": {
             "description": "Validation Error",
@@ -929,7 +976,11 @@
     },
     "/oauth/callback": {
       "get": {
-        "summary": "Callback",
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Todoist OAuth redirect target",
+        "description": "Redirect target for the Todoist OAuth authorise flow. Exchanges the `code` query parameter for an access token so Todoist marks the app as \"installed\" and starts delivering webhooks. The access token itself is discarded; the service uses the personal `TODOIST_API_TOKEN` from the environment for all subsequent Todoist API calls. On success, a marker file is written so `/setup` can display the authorised state.",
         "operationId": "callback_oauth_callback_get",
         "parameters": [
           {
@@ -999,7 +1050,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "OAuth flow completed successfully.",
             "content": {
               "text/html": {
                 "schema": {
@@ -1007,6 +1058,12 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Missing `code` or user denied access."
+          },
+          "500": {
+            "description": "Todoist token exchange failed."
           },
           "422": {
             "description": "Validation Error",
@@ -1026,7 +1083,8 @@
         "tags": [
           "setup"
         ],
-        "summary": "Setup Status",
+        "summary": "Setup status as JSON",
+        "description": "Machine-readable health of the self-hosted deployment: which credentials are set vs still placeholder, whether the Todoist app has been authorised, how many sorting projects are configured, the active LLM model, and the OAuth URL the user should visit to complete install. Consumed by `todolist-sorter status` in the CLI. No auth required.",
         "operationId": "setup_status_setup_status_get",
         "responses": {
           "200": {
@@ -1045,7 +1103,8 @@
         "tags": [
           "setup"
         ],
-        "summary": "Setup Page",
+        "summary": "Setup / onboarding page",
+        "description": "Self-service onboarding dashboard. Shows credential status (✓/✗), an \"Authorize with Todoist\" button with the OAuth URL pre-filled, and a step-by-step walk-through. Visit this page first after deploying the service. No auth required — the page itself does not leak secrets.",
         "operationId": "setup_page_setup_get",
         "responses": {
           "200": {
@@ -1064,6 +1123,39 @@
   },
   "components": {
     "schemas": {
+      "CacheEntry": {
+        "properties": {
+          "content_key": {
+            "type": "string",
+            "title": "Content Key",
+            "description": "Normalised item content (lower-case, whitespace collapsed) used as the cache key."
+          },
+          "category_name": {
+            "type": "string",
+            "title": "Category Name",
+            "description": "Category assigned by the LLM."
+          },
+          "transformed_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transformed Content",
+            "description": "When `additional_instructions` is active, the rewritten content the service writes back to the provider. Null for terminal cache entries keyed on the already-transformed form (used to prevent double LLM calls on echo webhooks)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "content_key",
+          "category_name"
+        ],
+        "title": "CacheEntry",
+        "description": "One row of the LLM-result cache for a project."
+      },
       "CategoriesReplace": {
         "properties": {
           "categories": {
@@ -1071,20 +1163,26 @@
               "type": "string"
             },
             "type": "array",
-            "title": "Categories"
+            "title": "Categories",
+            "description": "The complete new ordered category list. The service diffs this against the previous list: additions trigger a full cache clear, pure removals only clear the rows for removed names, pure reorders leave the cache intact."
           }
         },
         "type": "object",
         "required": [
           "categories"
         ],
-        "title": "CategoriesReplace"
+        "title": "CategoriesReplace",
+        "description": "Payload for atomic full replacement of a project's category list."
       },
       "CategoryAdd": {
         "properties": {
           "name": {
             "type": "string",
-            "title": "Name"
+            "title": "Name",
+            "description": "Category name to insert (free text, typically an emoji followed by a label).",
+            "examples": [
+              "🧊 Frozen"
+            ]
           },
           "at_index": {
             "anyOf": [
@@ -1095,14 +1193,19 @@
                 "type": "null"
               }
             ],
-            "title": "At Index"
+            "title": "At Index",
+            "description": "Target insertion index. Omit to append.",
+            "examples": [
+              5
+            ]
           }
         },
         "type": "object",
         "required": [
           "name"
         ],
-        "title": "CategoryAdd"
+        "title": "CategoryAdd",
+        "description": "Payload to insert one category into a project's list."
       },
       "CategoryPatch": {
         "properties": {
@@ -1115,7 +1218,8 @@
                 "type": "null"
               }
             ],
-            "title": "Name"
+            "title": "Name",
+            "description": "New category name. Setting this clears the project's entire cache because a rename can change the LLM-level semantics of the category."
           },
           "move_to": {
             "anyOf": [
@@ -1126,11 +1230,13 @@
                 "type": "null"
               }
             ],
-            "title": "Move To"
+            "title": "Move To",
+            "description": "New index (0-based). Does not touch the cache."
           }
         },
         "type": "object",
-        "title": "CategoryPatch"
+        "title": "CategoryPatch",
+        "description": "Payload to rename and/or move one category. Both fields are\noptional; combine them to do both in one call."
       },
       "HTTPValidationError": {
         "properties": {
@@ -1149,15 +1255,27 @@
         "properties": {
           "name": {
             "type": "string",
-            "title": "Name"
+            "title": "Name",
+            "description": "Human-readable project name shown in the UI and logs.",
+            "examples": [
+              "Lidl Shopping"
+            ]
           },
           "provider": {
             "type": "string",
-            "title": "Provider"
+            "title": "Provider",
+            "description": "Task-backend provider identifier. Only `todoist` is supported today.",
+            "examples": [
+              "todoist"
+            ]
           },
           "external_project_id": {
             "type": "string",
-            "title": "External Project Id"
+            "title": "External Project Id",
+            "description": "Provider-side project id (for Todoist: the numeric id from the project URL, passed as a string). Unique together with `provider`.",
+            "examples": [
+              "2345678901"
+            ]
           },
           "categories": {
             "items": {
@@ -1165,7 +1283,14 @@
             },
             "type": "array",
             "title": "Categories",
-            "default": []
+            "description": "Ordered list of category names. Items are reordered into this sequence. Items the LLM cannot match to any category are sorted to the very end (orphans).",
+            "examples": [
+              [
+                "🥬 Vegetables",
+                "🍎 Fruit",
+                "🥛 Dairy"
+              ]
+            ]
           },
           "description": {
             "anyOf": [
@@ -1176,7 +1301,8 @@
                 "type": "null"
               }
             ],
-            "title": "Description"
+            "title": "Description",
+            "description": "Free-text context passed to the LLM as part of the prompt (e.g. \"route through Lidl: entrance → checkout\")."
           },
           "additional_instructions": {
             "anyOf": [
@@ -1187,11 +1313,16 @@
                 "type": "null"
               }
             ],
-            "title": "Additional Instructions"
+            "title": "Additional Instructions",
+            "description": "Optional prompt extension that lets the LLM also transform each item's content (e.g. fix typos, prepend an emoji). When set, the transformed content is written back to the provider. Setting or changing this via PUT clears the project's cache and triggers a re-sort.",
+            "examples": [
+              "Fix obvious typos. Prepend a fitting emoji."
+            ]
           },
           "debounce_seconds": {
             "type": "integer",
             "title": "Debounce Seconds",
+            "description": "Per-project override for `DEFAULT_DEBOUNCE_SECONDS`. How long the debouncer waits after the last webhook event before running a sort.",
             "default": 5
           }
         },
@@ -1201,14 +1332,16 @@
           "provider",
           "external_project_id"
         ],
-        "title": "ProjectCreate"
+        "title": "ProjectCreate",
+        "description": "Payload to create a new sorting project."
       },
       "ProjectOut": {
         "properties": {
           "id": {
             "type": "string",
             "format": "uuid",
-            "title": "Id"
+            "title": "Id",
+            "description": "Server-assigned UUID."
           },
           "name": {
             "type": "string",
@@ -1272,7 +1405,8 @@
           "enabled",
           "debounce_seconds"
         ],
-        "title": "ProjectOut"
+        "title": "ProjectOut",
+        "description": "A sorting project as returned by the API."
       },
       "ProjectUpdate": {
         "properties": {
@@ -1285,7 +1419,8 @@
                 "type": "null"
               }
             ],
-            "title": "Name"
+            "title": "Name",
+            "description": "New human-readable project name."
           },
           "description": {
             "anyOf": [
@@ -1296,7 +1431,8 @@
                 "type": "null"
               }
             ],
-            "title": "Description"
+            "title": "Description",
+            "description": "Free-text context passed to the LLM prompt."
           },
           "additional_instructions": {
             "anyOf": [
@@ -1307,7 +1443,8 @@
                 "type": "null"
               }
             ],
-            "title": "Additional Instructions"
+            "title": "Additional Instructions",
+            "description": "Optional prompt extension for content transformation. Changing this value (including null↔value) clears the cache and triggers a re-sort so every item is re-evaluated under the new instructions."
           },
           "enabled": {
             "anyOf": [
@@ -1318,7 +1455,8 @@
                 "type": "null"
               }
             ],
-            "title": "Enabled"
+            "title": "Enabled",
+            "description": "Set to `false` to pause sorting without deleting the project. Disabled projects ignore incoming webhooks."
           },
           "debounce_seconds": {
             "anyOf": [
@@ -1329,11 +1467,13 @@
                 "type": "null"
               }
             ],
-            "title": "Debounce Seconds"
+            "title": "Debounce Seconds",
+            "description": "Per-project debouncer delay override, in seconds."
           }
         },
         "type": "object",
-        "title": "ProjectUpdate"
+        "title": "ProjectUpdate",
+        "description": "Partial update payload for a sorting project. Only provided fields\nare modified; omitted fields stay as they were."
       },
       "ProviderProject": {
         "properties": {

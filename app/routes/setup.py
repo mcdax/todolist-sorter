@@ -31,12 +31,34 @@ def build_setup_router(
     """
     router = APIRouter(tags=["setup"])
 
-    @router.get("/setup/status")
+    @router.get(
+        "/setup/status",
+        summary="Setup status as JSON",
+        description=(
+            "Machine-readable health of the self-hosted deployment: "
+            "which credentials are set vs still placeholder, whether the "
+            "Todoist app has been authorised, how many sorting projects "
+            "are configured, the active LLM model, and the OAuth URL "
+            "the user should visit to complete install. Consumed by "
+            "`todolist-sorter status` in the CLI. No auth required."
+        ),
+    )
     def setup_status(request: Request):
         status = get_setup_status(request)
         return JSONResponse(status)
 
-    @router.get("/setup", response_class=HTMLResponse)
+    @router.get(
+        "/setup",
+        response_class=HTMLResponse,
+        summary="Setup / onboarding page",
+        description=(
+            "Self-service onboarding dashboard. Shows credential status "
+            "(✓/✗), an \"Authorize with Todoist\" button with the OAuth "
+            "URL pre-filled, and a step-by-step walk-through. Visit "
+            "this page first after deploying the service. No auth "
+            "required — the page itself does not leak secrets."
+        ),
+    )
     def setup_page(request: Request):
         status = get_setup_status(request)
         html = _render_setup_html(status)

@@ -27,7 +27,33 @@ def build_webhook_router(
     def _get_session():
         yield from session_dep()
 
-    @router.post("/webhook/{provider}")
+    @router.post(
+        "/webhook/{provider}",
+        tags=["webhook"],
+        summary="Provider webhook receiver",
+        description=(
+            "Receives webhook events from a task provider (currently "
+            "`todoist`). Verifies the provider-specific signature "
+            "(`X-Todoist-Hmac-SHA256` for Todoist), parses the event "
+            "body, and either schedules a sort (via the debouncer) or "
+            "drops the event with status `ignored` / `suppressed`. "
+            "Always responds 200 with a JSON `{status: ...}` body so "
+            "the provider will not retry."
+        ),
+        responses={
+            200: {
+                "description": (
+                    "Event accepted. `queued` = sort scheduled; "
+                    "`ignored` = unknown project / no project id in "
+                    "payload; `suppressed` = echo of an item the "
+                    "service just wrote to itself."
+                ),
+            },
+            400: {"description": "Invalid JSON body."},
+            401: {"description": "Signature verification failed."},
+            404: {"description": "Unknown provider id in URL path."},
+        },
+    )
     async def receive(
         provider: str,
         request: Request,

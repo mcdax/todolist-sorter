@@ -21,7 +21,9 @@ def test_get_cache(client, engine):
     p = _create_seeded(client, engine)
     r = client.get(f"/projects/{p['id']}/cache", headers=AUTH)
     assert r.status_code == 200
-    assert r.json() == [{"content_key": "apple", "category_name": "A"}]
+    assert r.json() == [
+        {"content_key": "apple", "category_name": "A", "transformed_content": None}
+    ]
 
 
 def test_clear_cache(client, engine):

@@ -12,7 +12,27 @@ def build_oauth_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    @router.get("/oauth/callback", response_class=HTMLResponse)
+    @router.get(
+        "/oauth/callback",
+        response_class=HTMLResponse,
+        tags=["oauth"],
+        summary="Todoist OAuth redirect target",
+        description=(
+            "Redirect target for the Todoist OAuth authorise flow. "
+            "Exchanges the `code` query parameter for an access token "
+            "so Todoist marks the app as \"installed\" and starts "
+            "delivering webhooks. The access token itself is discarded; "
+            "the service uses the personal `TODOIST_API_TOKEN` from "
+            "the environment for all subsequent Todoist API calls. "
+            "On success, a marker file is written so `/setup` can "
+            "display the authorised state."
+        ),
+        responses={
+            200: {"description": "OAuth flow completed successfully."},
+            400: {"description": "Missing `code` or user denied access."},
+            500: {"description": "Todoist token exchange failed."},
+        },
+    )
     async def callback(
         code: str | None = None,
         state: str | None = None,
