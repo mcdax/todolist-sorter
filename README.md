@@ -42,6 +42,35 @@ You need:
 
 ---
 
+## Pick your mode
+
+The prerequisites below (Todoist app, HTTPS, OAuth) are the same either way.
+Once the service is running, you choose **how the sorting projects are
+managed**:
+
+### 🪶 Simple mode — "I have one shopping list, keep it sorted, that's it."
+
+Mount two text files and set three env vars. On container startup the
+service reconciles one sorting project from those files. Edit a file,
+restart the container, done. No REST calls, no CLI, no dashboards.
+
+Jump to [Simple mode](#simple-mode-one-static-list).
+
+### ⚙️ Advanced mode — "I want several projects, dynamic category lists, or integration from scripts or an AI agent."
+
+Use the REST API (or the `todolist-sorter` CLI, which wraps it) to
+create, update and delete projects on the fly. All endpoints are
+documented via Swagger UI at `/docs` and as OpenAPI 3.1 at
+`/openapi.json` — any LLM tool-calling agent can drive the service
+directly from the spec.
+
+Jump to [Advanced mode](#advanced-mode-rest-api).
+
+You can mix the two: let easy mode manage one project on startup and use
+the API for others.
+
+---
+
 ## Step 1 — Create the Todoist app
 
 Todoist only sends webhooks for users who have installed an "app" and
@@ -119,7 +148,7 @@ uvicorn app.main:create_app --factory --proxy-headers --forwarded-allow-ips='*'
 Point a subdomain (e.g. `sorter.example.com`) at your server and add a
 reverse-proxy config that forwards `/` to `todolist-sorter:8000` (compose)
 or `127.0.0.1:8000` (bare python). See [docs/reverse-proxy-examples.md](docs/reverse-proxy-examples.md)
-if you need templates for nginx / Caddy / SWAG.
+for templates for nginx / Caddy / SWAG / Traefik.
 
 Quick check:
 
@@ -157,24 +186,120 @@ If anything is red on that page, fix it and reload.
 
 ---
 
-## Step 6 — Create a sorting project
+## Simple mode — one static list
 
-A "sorting project" links one Todoist project to a list of categories in
-the order you want items to appear.
+Once steps 1-5 are done, pick your Todoist project, write two text files,
+and update `.env`. Restart the container. That's the whole setup.
+
+### 1. Find your Todoist project id
+
+Open the project in the Todoist web UI. The URL ends with the id:
+
+```
+https://app.todoist.com/app/project/2345678901
+                                    ^^^^^^^^^^
+```
+
+### 2. Write the two files
+
+```bash
+cd ~/todolist-sorter
+mkdir -p config
+
+cat > config/categories.txt <<'EOF'
+# one category per line, in the order you walk the store
+# lines starting with # are comments, blank lines are ignored
+
+🥬 Vegetables
+🍎 Fruit
+🥖 Bread
+🐟 Fish
+🥩 Meat
+🧀 Cheese
+🥛 Dairy
+❄  Frozen
+🧹 Household
+EOF
+
+cat > config/instructions.txt <<'EOF'
+Fix obvious spelling errors. Prepend a fitting emoji to items that don't
+have one. Keep the original language (German / English mixed is fine).
+EOF
+```
+
+`instructions.txt` is optional — leave it out if you only want sorting
+without content rewrites.
+
+### 3. Wire it in `compose.yaml`
+
+```yaml
+services:
+  todolist-sorter:
+    image: ghcr.io/mcdax/todolist-sorter:latest
+    container_name: todolist-sorter
+    env_file: [.env]
+    volumes:
+      - ./data:/app/data
+      - ./config:/config:ro       # ← new: mount the two files
+    environment:
+      AUTO_PROJECT_EXTERNAL_ID: "2345678901"
+      AUTO_PROJECT_NAME: "Shopping"
+      AUTO_CATEGORIES_FILE: /config/categories.txt
+      AUTO_INSTRUCTIONS_FILE: /config/instructions.txt
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+```
+
+### 4. Restart
+
+```bash
+docker compose up -d
+docker logs -f todolist-sorter | grep auto-project
+```
+
+First run:
+```
+INFO app.auto: auto-project: created 'Shopping' (…) with 9 categories, additional_instructions=True
+```
+
+Edit `config/categories.txt` later → `docker compose restart` → the
+service reconciles. Added category → cache cleared + re-sort. Renamed →
+cache cleared. Pure reorder → cache kept. Removed category → only that
+category's cached items are re-categorised.
+
+That's it. Add an item to the Todoist list and watch it jump into
+position a few seconds later.
+
+---
+
+## Advanced mode — REST API
+
+For anything more dynamic than one static list, use the REST API directly.
+
+**Why you might want this:**
+- Multiple shopping lists (Lidl, Aldi, the farmer's market — each with
+  its own category order).
+- An LLM agent that creates/edits lists on the fly. The app ships a full
+  OpenAPI 3.1 spec under `/openapi.json` — any tool-calling agent can
+  drive the service from it without any extra glue.
+- Scripted workflows (e.g. a cron job that regenerates the category list
+  weekly from a meal plan).
+
+### Manage projects
 
 Open `https://sorter.example.com/docs` in your browser — that's the
-interactive Swagger UI. Or use the CLI.
-
-Using the CLI locally (the CLI ships in the same image / package):
+interactive Swagger UI. Or use the bundled CLI, which wraps the same
+endpoints:
 
 ```bash
 export TODOLIST_SORTER_URL=https://sorter.example.com
 export TODOLIST_SORTER_API_KEY=…           # value from your .env
 
-# List your Todoist projects
+# List your Todoist projects interactively
 todolist-sorter remote list
 
-# Put your category order into a file (one category per line)
+# Put the category order into a file
 cat > lidl.txt <<'EOF'
 🥬 Vegetables
 🍎 Fruit
@@ -184,57 +309,57 @@ cat > lidl.txt <<'EOF'
 🧻 Household
 EOF
 
-# Create the sorting project (interactive picker if you omit --external-id)
+# Create a sorting project (interactive picker if you omit --external-id)
 todolist-sorter projects create \
   --name "Lidl" \
   --categories-file lidl.txt \
   --additional-instructions "Fix obvious typos. Prepend a fitting emoji."
 ```
 
-That's it. Add an item to the linked Todoist list and watch it get moved
-into place a few seconds later.
+### Feed the spec to an AI agent
 
----
+Any agent runtime that supports OpenAPI tool calling — Claude via
+`tool_use` on an OpenAPI spec, OpenAI Assistants with function tools, a
+LangChain `OpenAPIToolkit`, a Mastra / n8n workflow — can drive the
+service by pointing it at:
 
-## What can I tweak?
-
-| In `.env` | What it does |
-|---|---|
-| `LLM_MODEL` | e.g. `anthropic:claude-sonnet-4-6`, `ollama:glm-4.5`, `openai:gpt-4o-mini`. |
-| `LLM_BASE_URL` | Only needed for OpenAI-compatible endpoints like Ollama Cloud (`https://ollama.com/v1`). |
-| `DEFAULT_DEBOUNCE_SECONDS` | How long to wait after the last change before sorting. Default 5. |
-| `SUPPRESSION_WINDOW_SECONDS` | How long to ignore the webhook echoes of our own reorder. Default 30. |
-| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default `INFO`. |
-
-Per project (via `PUT /projects/{id}` or the CLI's `projects update`):
-- `additional_instructions` — free text the LLM uses when rewriting item
-  content. Set it to `"Fix obvious typos. Prepend a fitting emoji."` for
-  the shown behaviour.
-- `debounce_seconds` — overrides the global default for this project.
-- `enabled` — set to `false` to pause sorting without deleting the project.
-
-Managing categories after the fact:
-```bash
-todolist-sorter categories list   <project-id>
-todolist-sorter categories add    <project-id> "🧊 Frozen" --at-index 5
-todolist-sorter categories rename <project-id> 5 "❄ Frozen"
-todolist-sorter categories move   <project-id> 5 --to 7
-todolist-sorter categories remove <project-id> 5
 ```
+https://sorter.example.com/openapi.json
+```
+
+and configuring the `X-API-Key` header from `APP_API_KEY`. The spec
+includes examples and descriptions for every endpoint and every field.
+The agent can then create projects, edit category lists, inspect the
+cache, and trigger manual sorts without any additional tool definitions
+in your agent framework.
+
+### CLI cheat sheet
+
+```
+projects list / show / create / update / delete
+categories list / add / remove / rename / move / replace
+cache show / clear
+sort <project-id>                         # manual trigger
+
+status                                     # server setup status, no API key
+init                                       # interactive .env wizard
+```
+
+`todolist-sorter --help` for the full surface.
 
 ---
 
 ## API reference
 
-The API is documented via OpenAPI / Swagger, not in this README:
+Documented via OpenAPI / Swagger — this README stays short:
 
 - **Interactive docs**: `https://<your-host>/docs` (Swagger UI) or `/redoc`.
 - **Raw OpenAPI spec**: `https://<your-host>/openapi.json`.
 - **Versioned copy in this repo**: [`openapi.json`](openapi.json).
 
 All management endpoints (everything except `/healthz`, `/webhook/*`,
-`/oauth/callback`, and the setup page) require an `X-API-Key: <APP_API_KEY>`
-header.
+`/oauth/callback`, and the setup page) require an
+`X-API-Key: <APP_API_KEY>` header.
 
 Quick curl examples:
 
@@ -255,6 +380,37 @@ python scripts/export_openapi.py
 
 ---
 
+## What can I tweak?
+
+| In `.env` | What it does |
+|---|---|
+| `LLM_MODEL` | e.g. `anthropic:claude-sonnet-4-6`, `ollama:glm-4.5`, `openai:gpt-4o-mini`. |
+| `LLM_BASE_URL` | Only needed for OpenAI-compatible endpoints like Ollama Cloud (`https://ollama.com/v1`). |
+| `DEFAULT_DEBOUNCE_SECONDS` | How long to wait after the last change before sorting. Default 5. |
+| `SUPPRESSION_WINDOW_SECONDS` | How long to ignore the webhook echoes of our own reorder. Default 30. |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default `INFO`. |
+| `AUTO_PROJECT_*` | Simple-mode auto-reconcile — see the [Simple mode](#simple-mode-one-static-list) section. |
+
+Per project (via `PUT /projects/{id}` or the CLI's `projects update`):
+- `additional_instructions` — free text the LLM uses when rewriting item
+  content. Set it to `"Fix obvious typos. Prepend a fitting emoji."` for
+  the shown behaviour.
+- `debounce_seconds` — overrides the global default for this project.
+- `enabled` — set to `false` to pause sorting without deleting the project.
+
+Managing categories after the fact (advanced mode only; simple mode
+reconciles from the file):
+
+```bash
+todolist-sorter categories list   <project-id>
+todolist-sorter categories add    <project-id> "🧊 Frozen" --at-index 5
+todolist-sorter categories rename <project-id> 5 "❄ Frozen"
+todolist-sorter categories move   <project-id> 5 --to 7
+todolist-sorter categories remove <project-id> 5
+```
+
+---
+
 ## How it works (one level deeper)
 
 ```
@@ -269,25 +425,14 @@ Todoist webhook → HMAC check → suppression check → cache fast-path
 ```
 
 `openapi.json` + [`app/`](app/) are the source of truth; this description
-is just a mental model. Notable design choices:
-
-- A **cache** keyed on the lower-cased item content maps each known item
-  to its category. Most items are resolved without touching the LLM.
-- When `additional_instructions` is set, the cache also stores the
-  transformed form under its own key so the webhook echo of our own
-  content update is a cache hit, not a second LLM call.
-- The **suppression tracker** drops `item:updated` events for items the
-  service just wrote to, preventing echo loops.
-- A **per-project `asyncio.Lock`** keeps concurrent sort cycles from
-  stepping on each other.
+is just a mental model.
 
 ---
 
 ## Troubleshooting
 
 **`/setup` shows red entries** — follow the on-screen guidance. It is the
-diagnostic dashboard; nothing in the logs will ever tell you more than
-this page.
+diagnostic dashboard.
 
 **Webhooks are not arriving** — check the Todoist app console for the
 `item:added` / `item:updated` events, confirm the callback URL is
@@ -302,6 +447,11 @@ auto-generates one and logs it as `WARNING Auto-generated APP_API_KEY:
 **Webhook responded `"status": "suppressed"`** — this is normal
 immediately after a reorder. The service is ignoring its own echo events.
 Wait `SUPPRESSION_WINDOW_SECONDS` (30 s by default) and try again.
+
+**Simple mode: my edits to `categories.txt` were not picked up** — the
+service reconciles on startup only. Restart the container
+(`docker compose restart`). Live watching is intentionally not
+implemented.
 
 **LLM call times out or returns 500** — the service retries automatically
 (`0 s / 2 s / 5 s` backoff). If it gives up after three attempts, the
@@ -322,6 +472,3 @@ confirm the project is `enabled=true` (visible on `/setup` or via
 pip install -e '.[dev]'
 pytest
 ```
-
-183 tests covering the HTTP layer, the sort pipeline, the debouncer /
-suppression / retry logic, and the CLI.

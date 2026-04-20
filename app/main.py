@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import FastAPI
 from sqlmodel import Session, select
 
+from app.auto import sync_auto_project
 from app.backends.registry import BackendRegistry
 from app.backends.todoist import TodoistBackend
 from app.config import get_settings
@@ -25,6 +26,8 @@ from app.setup import (
 )
 from app.sorter import sort_project
 from app.suppression import SuppressionTracker
+
+log = logging.getLogger(__name__)
 
 
 # pydantic-ai picks credentials up from provider-specific env vars.
@@ -113,6 +116,20 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Easy mode: apply the env-var-driven auto-project spec on startup
+        try:
+            with Session(engine) as s:
+                auto_pid = sync_auto_project(s, settings)
+        except Exception:
+            log.exception("auto-project sync failed; continuing startup")
+            auto_pid = None
+        if auto_pid is not None:
+            try:
+                await debouncer.touch(
+                    auto_pid, delay=settings.default_debounce_seconds,
+                )
+            except Exception:
+                log.exception("auto-project: failed to schedule initial sort")
         yield
 
     app = FastAPI(

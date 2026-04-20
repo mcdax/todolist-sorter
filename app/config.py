@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     default_debounce_seconds: int = 5
     suppression_window_seconds: int = 30
 
+    # Easy mode: auto-create/reconcile one sorting project from env + files
+    # on startup. All fields are optional and inert unless
+    # `auto_project_external_id` is non-empty.
+    auto_project_external_id: str = ""
+    auto_project_provider: str = "todoist"
+    auto_project_name: str = "Auto"
+    auto_categories_file: str = ""
+    auto_instructions_file: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

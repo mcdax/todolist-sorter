@@ -8,6 +8,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.models import SortingProject
+from app.projects_ops import (
+    clear_cache_for_category,
+    clear_project_cache,
+)
 from app.routes.deps import require_api_key
 
 
@@ -291,22 +295,10 @@ def build_router(
             ),
         )
 
-    def _clear_cache(s: Session, pid: UUID) -> None:
-        from app.models import CategoryCache
-        for row in s.exec(
-            select(CategoryCache).where(CategoryCache.project_id == pid)
-        ).all():
-            s.delete(row)
-
-    def _clear_for_category(s: Session, pid: UUID, name: str) -> None:
-        from app.models import CategoryCache
-        for row in s.exec(
-            select(CategoryCache).where(
-                CategoryCache.project_id == pid,
-                CategoryCache.category_name == name,
-            )
-        ).all():
-            s.delete(row)
+    # Closure aliases for the shared helpers in app.projects_ops — keeps
+    # the route bodies below short and readable.
+    _clear_cache = clear_project_cache
+    _clear_for_category = clear_cache_for_category
 
     @router.get(
         "/{pid}/categories",
